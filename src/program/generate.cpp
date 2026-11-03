@@ -1,4 +1,5 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/platform/shared_memory_budget.hpp"
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -4087,6 +4088,20 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    {   // Before mapping embeddings or allocating dense weights on shared RAM.
+        int integrated = 0, device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess && integrated) {
+            if (strata::core::device_free_bytes() == 0) {
+                std::fprintf(stderr, "strata generate: no shared physical RAM remains after %.2f GiB headroom; "
+                                     "free memory before starting the model (STRATA_UMA_HEADROOM_GIB sets headroom)\n",
+                             double(strata::platform::uma_headroom_bytes()) / 1073741824.0);
+                return 1;
+            }
+        }
+    }
+#endif
     if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         // 0.2.8 Strix Halo: the gfx1151 rule above chose a chunk that fits this box; the "keep them small" 2048 would throw
@@ -4868,6 +4883,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: %s\n", err.c_str());
         return 1;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    {
+        int integrated = 0, device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess && integrated &&
+            pool_bytes > strata::core::device_free_bytes()) {
+            std::fprintf(stderr, "strata generate: the %.2f GiB weight arena exceeds available shared RAM "
+                                 "after headroom; free memory before starting the model\n",
+                         double(pool_bytes) / 1073741824.0);
+            return 1;
+        }
+    }
+#endif
     void* arena = nullptr;
     if (const cudaError_t ce = cudaMalloc(&arena, pool_bytes); ce != cudaSuccess) {
         // #486: the arena is the first large allocation and its size does not depend on the context, so what is
@@ -4932,6 +4960,25 @@ int main(int argc, char** argv) {
 
     strata::core::NativeDense native_dense;
     if (!o.native_dense_gguf.empty()) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        int integrated = 0, device = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) == cudaSuccess && integrated) {
+            uint64_t dense_bytes = 0;
+            const int64_t end_layer = stage_trim ? split_at[0] : INT64_MAX;
+            if (!strata::core::NativeDense::weight_bytes_for(o.native_dense_gguf, wt, o.native_ple_key,
+                                                          0, end_layer, dense_bytes, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            if (dense_bytes > strata::core::device_free_bytes()) {
+                std::fprintf(stderr, "strata generate: %.2f GiB of native dense weights exceeds available shared RAM "
+                                     "after headroom; free memory before starting the model\n",
+                             double(dense_bytes) / 1073741824.0);
+                return 1;
+            }
+        }
+#endif
         if (!native_dense.load(o.native_dense_gguf, wt, err, o.native_ple_key)) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
@@ -6987,6 +7034,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool shared_gpu_memory = false;
     {   // the card, and whether this build has code for it (a binary built for other GPUs fails at its first kernel
         // otherwise, after the whole expert arena has loaded) - before the arena starts loading
         int dev = 0;
@@ -6994,6 +7042,32 @@ int main(int argc, char** argv) {
         const bool named = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!named) cudaGetLastError();
         const char* name = named && p.name[0] ? p.name : "(an unnamed GPU)";
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        shared_gpu_memory = named && p.integrated;
+        if (named && p.integrated) {
+            const uint64_t headroom = strata::platform::uma_headroom_bytes();
+            o.resident_headroom = std::max(o.resident_headroom, headroom);
+            std::fprintf(stderr, "strata generate: integrated CUDA GPU: CPU and GPU share physical RAM; "
+                                 "allocation headroom %.2f GiB, managed concurrency %d\n",
+                         (double) headroom / 1073741824.0, p.concurrentManagedAccess);
+            if (!o.mmap_experts) {
+                strata::core::detail::HostMemory memory;
+                const uint64_t experts = strata::kernels::cpu::expert_layout().total;
+                if (!strata::core::detail::host_available_memory(memory) ||
+                    experts > strata::platform::shared_allocation_budget(memory.available, p.totalGlobalMem, headroom)) {
+                    if (!o.shared_expert_arena.empty()) {
+                        std::fprintf(stderr, "strata generate: --shared-expert-arena cannot fit available shared RAM; "
+                                             "use a file-backed expert configuration\n");
+                        return 1;
+                    }
+                    std::fprintf(stderr, "strata generate: the %.2f GiB expert arena does not fit available shared RAM "
+                                         "with headroom; using file-backed experts (--mmap-experts)\n",
+                                 (double) experts / 1073741824.0);
+                    o.mmap_experts = true;
+                }
+            }
+        }
+#endif
 #if defined(STRATA_USE_HIP)
         std::fprintf(stderr, "strata generate: GPU %d: %s (%s)\n", dev, name, named ? p.gcnArchName : "?");
         // the first prompt's one-time hipBLAS library loads (about 2.5 s), done on a thread while the expert arena loads
@@ -7519,6 +7593,14 @@ int main(int argc, char** argv) {
         // floor there would only cost 16 GB+ NVIDIA cards ~1.8 GiB of cache.  A reserve given on the command line is
         // kept as it is; a smaller card keeps its own sizing (#496 lowers the reserve further when the cache would not
         // fit); and this is said, never silent.  The cache size changes no output bit.
+        // On Orin the first MTP request allocates CUDA/prompt workspaces after
+        // this sizing step. Keep a separate workspace reserve, in addition to
+        // device_free_bytes()'s physical-RAM headroom. Explicit settings stand.
+        if (shared_gpu_memory && !o.vram_reserve_given && o.vram_reserve_mib < 3072) {
+            o.vram_reserve_mib = 3072;
+            std::fprintf(stderr, "strata generate: shared RAM: automatic expert cache keeps 3072 MiB for late "
+                                 "prompt, verification and CUDA workspaces, in addition to physical RAM headroom\n");
+        }
         constexpr int kWddmAutoReserveMib = 2560;
         if (!o.vram_reserve_given && o.vram_reserve_mib < kWddmAutoReserveMib) {
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
@@ -7628,7 +7710,7 @@ int main(int argc, char** argv) {
         // stops, saying what is short and what makes room.  A card the default reserve leaves that much is sized as
         // before.
         constexpr int kSmallReserveMib = 300;
-        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
+        if (o.expert_cache < min_slots && !shared_gpu_memory && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
@@ -7965,13 +8047,15 @@ int main(int argc, char** argv) {
             if (!shrink_to(keep_bytes)) break;
         }
         if (failed > 0 && o.expert_cache > 0)
-            std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - a bigger "
-                                 "page file lets it use more of the free VRAM\n",
-                         o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed);
+            std::fprintf(stderr, "strata generate: expert cache: %d slots (%.2f GiB) after %d smaller tries - %s\n",
+                         o.expert_cache, (double) xcache.bytes() / 1073741824.0, failed,
+                         shared_gpu_memory ? "free shared RAM determines the cache size"
+                                           : "a bigger page file lets it use more of the free VRAM");
     }
     if (o.expert_cache > 0) {
-        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
-                     (long long) xcache.slots(), xcache.gib());
+        std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of %s; policy is\n",
+                     (long long) xcache.slots(), xcache.gib(),
+                     shared_gpu_memory ? "shared RAM allocated to the GPU" : "VRAM");
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
@@ -13208,7 +13292,19 @@ int main(int argc, char** argv) {
             // below ~256 MiB a later allocation (a first-used window's buffers, the desktop, another program) can make
             // the driver page GPU memory, and a verify graph spinning on a host flag then never finishes
             const int64_t free_mib = (int64_t) (free_b >> 20);
-            if (free_mib >= 256) {
+            if (shared_gpu_memory) {
+                strata::core::detail::HostMemory memory;
+                const uint64_t headroom = strata::platform::uma_headroom_bytes();
+                if (!strata::core::detail::host_available_memory(memory) || memory.available < headroom) {
+                    std::fprintf(stderr, "strata serve: shared RAM availability is below physical RAM headroom after "
+                                         "initialization; lower --expert-cache or close other memory users\n");
+                    return 1;
+                }
+                std::fprintf(stderr, "strata serve: %llu MiB shared RAM available with everything loaded; "
+                                     "%llu MiB physical RAM headroom\n",
+                             (unsigned long long) (memory.available >> 20), (unsigned long long) (headroom >> 20));
+                rss_probe("serving");
+            } else if (free_mib >= 256) {
                 std::fprintf(stderr, "strata serve: %lld MiB of VRAM free with everything loaded\n", (long long) free_mib);
 #ifdef _WIN32
                 if (free_mib < 512 && o.prefill_auto)   // #1275: said, never changed (the chunk is the operator's to cap)
