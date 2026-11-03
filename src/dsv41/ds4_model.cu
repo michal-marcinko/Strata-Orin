@@ -281,7 +281,12 @@ size_t uma_free(int dev, size_t fr) {
     if (!integrated) return fr;
     const char* h = std::getenv("DS4_UMA_HEADROOM_GIB");
     const uint64_t head = (uint64_t) (h ? std::atof(h) : 6.0) << 30, avail = ram_avail();
-    if (avail != ~uint64_t{0} && avail > head && avail - head > fr) return (size_t) (avail - head);
+    // The headroom comes off whichever figure is used.  A GB10's cudaMemGetInfo counts only MemFree, so MemAvailable is the
+    // larger one there (unchanged).  A Jetson Orin's already counts the page cache (54 GB "free" on a 61 GB board): taking
+    // it as it was left no room for the OS, the dense weights and the engine's pinned buffers, and a later cudaHostAlloc
+    // failed (nvmap error 12) whenever the expert share came out a GB or two larger.
+    const uint64_t base = avail != ~uint64_t{0} && avail > fr ? avail : (uint64_t) fr;
+    return (size_t) (base > head ? base - head : 0);
 #else
     (void) dev;
 #endif
