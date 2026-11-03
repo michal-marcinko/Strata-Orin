@@ -2,7 +2,6 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include "strata/platform/cpu_relax.hpp"
-#include "strata/platform/cpu_relax.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -77,7 +76,7 @@ int main() {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
     for (uint32_t i = 1; ok && i <= 512; ++i) {
         while (poll->seq < i && poll->result == 0 && std::chrono::steady_clock::now() < deadline)
-            strata::platform::cpu_relax();
+            strata_cpu_pause();
         strata_load_fence();
         if (poll->seq < i || poll->result != 0 || poll->gpu_value != i * 3) { ok = false; break; }
         poll->cpu_value = i * 7;

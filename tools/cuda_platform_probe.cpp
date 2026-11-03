@@ -29,7 +29,7 @@ static std::string json_string(const char* text) {
 int main(int argc, char** argv) {
     const bool json = argc == 2 && std::strcmp(argv[1], "--json") == 0;
     if (argc > 1 && !json) { std::fprintf(stderr, "usage: strata-cuda-probe [--json]\n"); return 2; }
-    strata::platform::cpu_relax();
+    strata_cpu_pause();
     int count = 0, driver = 0, runtime = 0;
     if (!checked(cudaGetDeviceCount(&count), "cudaGetDeviceCount") ||
         !checked(cudaDriverGetVersion(&driver), "cudaDriverGetVersion") ||
