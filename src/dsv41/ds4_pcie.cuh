@@ -149,6 +149,59 @@ __global__ void __launch_bounds__(256) stream_fetch_kernel(Pull* p, unsigned seq
         }
 }
 
+/// The GPU lane (ds4_gpulane.hpp, an integrated GPU): a decode request's picks the host put in pinned slots - slot[i] >= 0:
+/// pick i's expert at ptr[i] (the layer's lane layout) once the slot's flag reads gen[i] (gen[i] | 0x80000000: its read
+/// failed - the pick is left out).  Host-mapped, a ring by seq like the requests; seq written last.
+constexpr int kGlPicks = 8;
+struct GlPull {
+    unsigned seq;
+    unsigned pad[3];
+    unsigned long long ptr[kGlPicks];
+    unsigned gen[kGlPicks];
+    int slot[kGlPicks];
+};
+// one thread: the pull, then each pick's slot flag; plan2[i] = the slot (0: none), plan[i] too (the down pass and the
+// sum take it as a VRAM expert).  Gives up after 20 s (a host that never answers: the pick left out, no hang for good)
+__global__ void gl_fetch_kernel(const GlPull* p, unsigned seq, const unsigned* flags, unsigned long long* plan,
+                                unsigned long long* plan2, int k) {
+    if (threadIdx.x != 0) return;
+    volatile const GlPull* vp = (volatile const GlPull*) p;
+    volatile const unsigned* vf = (volatile const unsigned*) flags;
+    const unsigned long long t0 = pull_clock(), lim = 20000000000ull;
+    bool late = false;
+    while (vp->seq != seq) {
+        pull_nap();
+        if (pull_clock() - t0 > lim) {
+            late = true;
+            break;
+        }
+    }
+    __threadfence_system();
+    for (int i = 0; i < k; ++i) {
+        unsigned long long d = 0ull;
+        const int s = late ? -1 : vp->slot[i];
+        if (s >= 0) {
+            const unsigned g = vp->gen[i];
+            for (;;) {
+                const unsigned f = vf[s];
+                if (f == g) {
+                    d = vp->ptr[i];
+                    break;
+                }
+                if (f == (g | 0x80000000u) || pull_clock() - t0 > lim) break;
+                pull_nap();
+            }
+        }
+        plan2[i] = d;
+        if (d != 0ull) plan[i] = d;
+    }
+    __threadfence_system();
+}
+inline void gl_fetch(const GlPull* p, unsigned seq, const unsigned* flags, unsigned long long* plan,
+                     unsigned long long* plan2, int k, cudaStream_t s) {
+    strata_ds4_launch(gl_fetch_kernel, 1, 32, 0, s, p, seq, flags, plan, plan2, k);
+}
+
 inline void stream_fetch(Pull* p, unsigned seq, unsigned* dflag, uint8_t* vram, size_t stride, const Mats& m,
                          bool copy, unsigned long long* plan, unsigned long long* plan2, int k, int blocks,
                          cudaStream_t s) {

@@ -111,6 +111,12 @@ struct Stats {
     int64_t store_bytes = 0, store_fails = 0;
     int64_t store_zc = 0, store_zc_visible = 0;   // experts the GPU computed from the store (zero-copy over PCIe); slots it may read
     double store_wait_ms = 0.0, store_busy_ms = 0.0;
+    // the GPU lane (DS4_GL): picks asked for, of them ready / still being read / not held (read now) / no slot (CPU lane);
+    // guesses read ahead, used, dropped unread; chunks copied from the page cache, read from the disk, failed; their bytes
+    int64_t gl_demand = 0, gl_ready = 0, gl_filling = 0, gl_missed = 0, gl_no_slot = 0;
+    int64_t gl_pf = 0, gl_pf_used = 0, gl_pf_dropped = 0, gl_ch_cache = 0, gl_ch_disk = 0, gl_ch_fail = 0;
+    int64_t gl_b_cache = 0, gl_b_disk = 0;
+    int64_t gl_waited = 0, gl_wait_us = 0, gl_kicks = 0, gl_slow = 0, gl_slow_us = 0;
     int64_t store_slots = 0, store_slots_max = 0;
     int64_t drafts_offered = 0, drafts_accepted = 0, drafts_rounds = 0;
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted

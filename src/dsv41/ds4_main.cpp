@@ -2808,6 +2808,25 @@ int main(int argc, char** argv) {
     const long long io1 = io_read_bytes();
     if (io0 >= 0 && io1 >= 0)
         std::fprintf(stderr, "decode reads from the disk: %.1f MB a token\n", (double) (io1 - io0) / 1e6 / nt);
+    if (s.gl_demand > s0.gl_demand) {   // DS4_GL: the GPU lane
+        const double dm = (double) (s.gl_demand - s0.gl_demand);
+        std::fprintf(stderr, "GPU lane: %.1f picks a token: %.1f%% ready when asked, %.1f%% still being read, %.1f%% read only then, "
+                             "%.1f%% no slot (CPU lane); guesses %.1f a token, %.1f%% used, %.1f%% dropped unread; per token %.1f MB "
+                             "copied from the page cache, %.1f MB read from the disk; %lld failed chunks\n",
+                     dm / nt, 100.0 * (double) (s.gl_ready - s0.gl_ready) / dm, 100.0 * (double) (s.gl_filling - s0.gl_filling) / dm,
+                     100.0 * (double) (s.gl_missed - s0.gl_missed) / dm, 100.0 * (double) (s.gl_no_slot - s0.gl_no_slot) / dm,
+                     (double) (s.gl_pf - s0.gl_pf) / nt,
+                     100.0 * (double) (s.gl_pf_used - s0.gl_pf_used) / std::max(1.0, (double) (s.gl_pf - s0.gl_pf)),
+                     100.0 * (double) (s.gl_pf_dropped - s0.gl_pf_dropped) / std::max(1.0, (double) (s.gl_pf - s0.gl_pf)),
+                     (double) (s.gl_b_cache - s0.gl_b_cache) / 1e6 / nt, (double) (s.gl_b_disk - s0.gl_b_disk) / 1e6 / nt,
+                     (long long) (s.gl_ch_fail - s0.gl_ch_fail));
+        const double wn = (double) (s.gl_waited - s0.gl_waited);
+        std::fprintf(stderr, "GPU lane: %.1f picks a token asked for before their read was done, %.2f ms from the ask to the "
+                             "read's end on average (%.1f ms a token summed); %lld kicks, %lld reads over 50 ms (%.0f ms in all)\n",
+                     wn / nt, wn > 0 ? (double) (s.gl_wait_us - s0.gl_wait_us) / 1e3 / wn : 0.0,
+                     (double) (s.gl_wait_us - s0.gl_wait_us) / 1e3 / nt, (long long) (s.gl_kicks - s0.gl_kicks),
+                     (long long) (s.gl_slow - s0.gl_slow), (double) (s.gl_slow_us - s0.gl_slow_us) / 1e3);
+    }
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,

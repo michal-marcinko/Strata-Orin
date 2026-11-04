@@ -30,6 +30,7 @@
 #include "ds4_path_policy.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
+#include "ds4_gpulane.hpp"
 #include "ds4_vision.cuh"
 #if defined(STRATA_GPU_METAL)
 #include "ds4_vision_metal.h"   // the Metal tower's capability marker
@@ -1417,6 +1418,16 @@ struct Model::Impl {
     }();
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
+    // the GPU lane (ds4_gpulane.hpp, DS4_GL=1, an integrated GPU): a decoded token's CPU-lane picks read into pinned slots and
+    // computed by the GPU's own expert kernels in place (null: off)
+    std::unique_ptr<GpuLane> gl;
+    std::vector<uint8_t> gl_ok;                 // [layer]: its decode picks go to the GPU lane
+    std::vector<x3::ExpertLayout> gl_lay;       // [layer]: its experts' layout in a lane slot
+    pcie::GlPull* gl_pull = nullptr;            // host-mapped [kRing]
+    unsigned* gl_flags = nullptr;               // host-mapped [slots]
+    unsigned long long* gl_plan2 = nullptr;     // device [kPicks]: the lane's picks' plan (their gate / up and down)
+    uint8_t* gl_slab = nullptr;                 // host-mapped: the slots
+    int gl_pf_n = 16;                           // DS4_GL_PF_N: the next layer's guesses read ahead, by rank (the best n)
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -3797,6 +3808,7 @@ struct Model::Impl {
         one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
         preload_store();
+        if (!init_gl(err)) return false;
         // On by default for a Windows HIP build on an APU (Strix Halo: measured +7.5% decode, no change in the prompt); DS4_NO_VIEW=1 forces it
         // on anywhere, DS4_NO_VIEW=0 turns it off
         bool no_view = std::getenv("DS4_NO_VIEW") != nullptr && std::atoi(std::getenv("DS4_NO_VIEW")) != 0;
@@ -6537,6 +6549,273 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: RAM store: %.1f GB of RAM free after the GPU's weights: store sized %.1f GB, not %.1f\n",
                          (double) avail / 1e9, now, gb);
         return std::min(gb, now);
+    }
+    // the GPU lane (ds4_gpulane.hpp): DS4_GL=1 on an integrated GPU (one device, the decode's async path, no RAM store, no
+    // stream lane); DS4_GL_SLOTS (32), DS4_GL_THREADS (6 readers), DS4_GL_CHUNK_KB (1024), DS4_GL_DIRECT=0 (misses read
+    // buffered, the page cache keeps them; default unbuffered), DS4_GL_FORCE=1 (a discrete GPU too: it reads the slots over
+    // PCIe - tests)
+    bool init_gl(std::string& err) {
+#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+        if (env_tri("DS4_GL") <= 0) return true;
+        const char* why = nullptr;
+        int integ = 0;
+        if (!devs.empty() && cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, devs[0].id) != cudaSuccess) cudaGetLastError();
+        if (!pk.gguf) why = "not a GGUF";
+        else if (!moe_token_path || sync_decode) why = "not the async token path";
+        else if (store) why = "the RAM store is on";
+        else if (devs.size() != 1) why = "more than one GPU";
+        else if (copy_mode) why = "the experts copied into RAM";
+        else if (!lane_env_off()) why = "the stream lane is on (DS4_STREAM)";
+        else if (!integ && env_tri("DS4_GL_FORCE") <= 0) why = "not an integrated GPU (DS4_GL_FORCE=1: anyway)";
+        if (why != nullptr) {
+            std::fprintf(stderr, "ds4: GPU lane off: %s\n", why);
+            return true;
+        }
+        std::vector<GpuLane::Geo> geo(L.size());
+        int nl = 0;
+        for (const Layer& l : L) {
+            GpuLane::Geo& g = geo[(size_t) l.il];
+            if (l.mtp || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4 || l.k_exp <= 0 || l.k_exp > pcie::kGlPicks || l.blob == 0 ||
+                l.n_exp > 1024 || (int) l.slot.size() < l.n_exp)
+                continue;
+            bool any = false;
+            for (int e = 0; e < l.n_exp && !any; ++e) any = file_read(l, e);
+            if (!any) continue;
+            bool ok = true;
+            for (int r = 0; r < 3; ++r) {
+                g.file[r] = l.mx_file[r];
+                g.off[r] = l.mx_off[r];
+                g.stride[r] = l.mx_stride[r];
+                g.bytes[r] = mx_part_bytes(l, r);
+                ok = ok && g.file[r] >= 0 && (size_t) g.file[r] < pk.maps.size() && g.stride[r] % GpuLane::kAlign == 0 &&
+                     g.off[r] % 16 == 0;
+            }
+            g.ok = ok;
+            nl += ok;
+        }
+        const uint64_t stride = GpuLane::layout(geo);
+        if (nl == 0 || stride == 0) {
+            std::fprintf(stderr, "ds4: GPU lane off: no layer's experts fit its slots\n");
+            return true;
+        }
+        GpuLane::Cfg c;
+        c.slots = std::max(8, std::min(256, (int) env_f("DS4_GL_SLOTS", 32.0f)));
+        c.threads = std::max(1, std::min(16, (int) env_f("DS4_GL_THREADS", 6.0f)));
+        c.chunk = (uint64_t) std::max(64, std::min(16384, (int) env_f("DS4_GL_CHUNK_KB", 1024.0f))) << 10;
+        c.direct = env_tri("DS4_GL_DIRECT") != 0;
+        c.kick_ms = env_f("DS4_GL_KICK_MS", 4.0f);
+        c.kick_fd = !pk.dfds.empty() ? (int) pk.dfds[0] : -1;
+        {   // the readers' CPUs: DS4_GL_CPUS=a,b,.. (none: unpinned), else the last `threads` CPUs this process may use
+            const char* v = std::getenv("DS4_GL_CPUS");
+            if (v != nullptr) {
+                std::stringstream ss(v);
+                std::string x;
+                while (std::getline(ss, x, ','))
+                    if (!x.empty() && x != "none") c.cpus.push_back(std::atoi(x.c_str()));
+            } else {
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                std::vector<int> mine;
+                if (sched_getaffinity(0, sizeof set, &set) == 0)
+                    for (int i = 0; i < CPU_SETSIZE; ++i)
+                        if (CPU_ISSET(i, &set)) mine.push_back(i);
+                for (int i = std::max(0, (int) mine.size() - c.threads); i < (int) mine.size(); ++i) c.cpus.push_back(mine[(size_t) i]);
+            }
+        }
+        gl_pf_n = std::max(0, (int) env_f("DS4_GL_PF_N", 16.0f));
+        Dev& d = devs[0];
+        cudaSetDevice(d.id);
+        if (!hmap(gl_slab, (size_t) c.slots * stride, err) || !hmap(gl_pull, (size_t) kRing, err) ||
+            !hmap(gl_flags, (size_t) c.slots, err) || !dalloc(d, gl_plan2, kPicks, err))
+            return false;
+        void* hd = nullptr;
+        if (cudaHostGetDevicePointer(&hd, gl_slab, 0) != cudaSuccess || hd != (void*) gl_slab) {
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4: GPU lane off: the GPU addresses the pinned slots elsewhere\n");
+            return true;
+        }
+        for (int i = 0; i < kRing; ++i) gl_pull[i].seq = 0;
+        std::vector<GpuLane::File> files(pk.maps.size());
+        for (size_t f = 0; f < files.size(); ++f) {
+            files[f].dfd = f < pk.dfds.size() ? (int) pk.dfds[f] : -1;
+            files[f].bfd = f < pk.fds.size() ? (int) pk.fds[f] : -1;
+            files[f].map = pk.maps[f].first;
+            files[f].size = pk.maps[f].second;
+        }
+        gl_ok.assign(L.size(), 0);
+        gl_lay.assign(L.size(), x3::ExpertLayout{});
+        for (const Layer& l : L) {
+            const GpuLane::Geo& g = geo[(size_t) l.il];
+            if (!g.ok) continue;
+            gl_ok[(size_t) l.il] = 1;
+            x3::ExpertLayout lay = l.lay;
+            for (int r = 0; r < 3; ++r) lay.trellis[r] = (size_t) (g.reg[r] + g.lead[r]);
+            gl_lay[(size_t) l.il] = lay;
+        }
+        auto lane = std::make_unique<GpuLane>();
+        lane->init(c, geo, files, gl_slab, stride, gl_flags);
+        gl = std::move(lane);
+        if (env_tri("DS4_GL_CHECK") > 0) gl_check();
+        std::fprintf(stderr, "ds4: GPU lane: %d layers' CPU-lane picks computed by the GPU from %d pinned slots of %.1f MB "
+                             "(%.0f MB), %d reading threads (CPUs %s), %llu KB reads, misses %s, kicks after %.1f ms\n",
+                     nl, c.slots, stride / 1e6, c.slots * (double) stride / 1e6, c.threads,
+                     [&] { std::string t; for (int x : c.cpus) t += (t.empty() ? "" : ",") + std::to_string(x); return t.empty() ? std::string("any") : t; }().c_str(),
+                     (unsigned long long) (c.chunk >> 10), c.direct ? "unbuffered" : "through the page cache", c.kick_ms);
+#else
+        (void) err;
+#endif
+        return true;
+    }
+    // DS4_GL_CHECK=1 (load): experts of a few layers of each format through three paths on one normalised input - the CPU
+    // lane, the GPU from a lane slot (read unbuffered, and again from the page cache) and the GPU from the expert's blob in the
+    // engine's own layout - the two GPU results must be bit-identical (the same kernels on the same bytes), the CPU lane's
+    // within its rounding
+    void gl_check() {
+#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+        Dev& d = devs[0];
+        cudaSetDevice(d.id);
+        const int E = g.dim, FF = g.ff;
+        std::vector<float> x((size_t) E);
+        double ss = 0;
+        for (int i = 0; i < E; ++i) {
+            x[(size_t) i] = std::sin(0.71f * (float) i) + ((i % 97) == 0 ? 6.0f : 0.0f);
+            ss += (double) x[(size_t) i] * x[(size_t) i];
+        }
+        for (float& v : x) v = (float) (v / std::sqrt(ss / E));
+        float *dx = nullptr, *dh = nullptr, *dsh = nullptr, *dout = nullptr, *dw = nullptr;
+        unsigned long long* dplan = nullptr;
+        uint8_t* blob = nullptr;
+        size_t maxb = 0;
+        for (const Layer& l : L) maxb = std::max(maxb, l.blob);
+        if (cudaMalloc(&dx, (size_t) E * 4) != cudaSuccess || cudaMalloc(&dh, (size_t) kPicks * FF * 4) != cudaSuccess ||
+            cudaMalloc(&dsh, (size_t) E * 4) != cudaSuccess || cudaMalloc(&dout, (size_t) E * 4) != cudaSuccess ||
+            cudaMalloc(&dw, kPicks * 4) != cudaSuccess || cudaMalloc(&dplan, kPicks * 8) != cudaSuccess ||
+            cudaHostAlloc((void**) &blob, maxb + 4096, cudaHostAllocMapped) != cudaSuccess) {
+            cudaGetLastError();
+            std::fprintf(stderr, "ds4: GPU lane check: no scratch\n");
+            return;
+        }
+        std::vector<float> w(kPicks, 0.0f);
+        w[0] = 1.0f;
+        cudaMemcpy(dw, w.data(), kPicks * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(dx, x.data(), (size_t) E * 4, cudaMemcpyHostToDevice);
+        cudaMemset(dsh, 0, (size_t) E * 4);
+        const auto gpu = [&](const Layer& l, const x3::ExpertLayout& lay, const uint8_t* p) {
+            unsigned long long pl[kPicks] = {};
+            pl[0] = (unsigned long long) p;
+            cudaMemcpy(dplan, pl, sizeof pl, cudaMemcpyHostToDevice);
+            x3::MoeArgs ma;
+            ma.plan_ptr = dplan;
+            ma.plan_w = dw;
+            ma.lay = lay;
+            ma.k = l.k_exp;
+            ma.n_embd = E;
+            ma.n_ff = FF;
+            ma.limit = g.lim;
+            gg::moe_gate_up(ma, dx, dh, d.st);
+            gg::moe_down(ma, dh, dsh, dout, d.st);
+            std::vector<float> y((size_t) E);
+            cudaMemcpyAsync(y.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, d.st);
+            cudaStreamSynchronize(d.st);
+            return y;
+        };
+        std::vector<std::string> fmts;
+        int n_ok = 0, n_bad = 0;
+        double worst_rel = 0;
+        for (const Layer& l : L) {
+            if (!gl_ok[(size_t) l.il]) continue;
+            const std::string f = lane_fmt(l);
+            if (std::count(fmts.begin(), fmts.end(), f) >= 2) continue;   // (two layers of each format)
+            fmts.push_back(f);
+            const GpuLane::Geo& ge = gl->geo(l.il);
+            int tried = 0;
+            for (int e = 0; e < l.n_exp && tried < 2; ++e) {
+                if (!file_read(l, e)) continue;
+                ++tried;
+                // the slot read unbuffered first (its pages out of the page cache: none of them mapped yet), then the CPU lane
+                // and the blob (which bring them in), then the slot again from the page cache
+                for (int r = 0; r < 3; ++r)
+                    posix_fadvise((int) pk.fds[(size_t) ge.file[r]], (off_t) (ge.off[r] + (uint64_t) e * ge.stride[r]),
+                                  (off_t) ge.bytes[r], POSIX_FADV_DONTNEED);
+                std::vector<float> ys[2];
+                int64_t via[2][2] = {};
+                {
+                    const int64_t c0 = gl->stats().ch_cache.load(), d0 = gl->stats().ch_direct.load() + gl->stats().ch_buf.load();
+                    const int sl = gl->fill_now(l.il, e);
+                    if (sl >= 0) ys[0] = gpu(l, gl_lay[(size_t) l.il], gl->base(sl));
+                    via[0][0] = gl->stats().ch_cache.load() - c0;
+                    via[0][1] = gl->stats().ch_direct.load() + gl->stats().ch_buf.load() - d0;
+                }
+                std::vector<Ent> ents(1);
+                ents[0].e = e;
+                ents[0].n = 1;
+                ents[0].tok[0] = 0;
+                cpu_experts(l, x.data(), ents, (size_t) E);
+                const std::vector<float> yc(c_yd.begin(), c_yd.begin() + E);
+                if (!read_mx_file(l, e, blob)) {
+                    ++n_bad;
+                    continue;
+                }
+                const std::vector<float> yb = gpu(l, l.lay, blob);
+                {
+                    const int64_t c0 = gl->stats().ch_cache.load(), d0 = gl->stats().ch_direct.load() + gl->stats().ch_buf.load();
+                    const int sl = gl->fill_now(l.il, e);
+                    if (sl >= 0) ys[1] = gpu(l, gl_lay[(size_t) l.il], gl->base(sl));
+                    via[1][0] = gl->stats().ch_cache.load() - c0;
+                    via[1][1] = gl->stats().ch_direct.load() + gl->stats().ch_buf.load() - d0;
+                }
+                double mx = 0;
+                for (int i = 0; i < E; ++i) mx = std::max(mx, (double) std::fabs(yc[(size_t) i]));
+                for (int pass = 0; pass < 2; ++pass) {
+                    if (ys[pass].empty()) {
+                        ++n_bad;
+                        std::fprintf(stderr, "ds4: GPU lane check: layer %d expert %d: the slot's read FAILED\n", l.il, e);
+                        continue;
+                    }
+                    double df = 0;
+                    for (int i = 0; i < E; ++i) df = std::max(df, std::fabs((double) yc[(size_t) i] - (double) ys[pass][(size_t) i]));
+                    const bool same = std::memcmp(ys[pass].data(), yb.data(), (size_t) E * 4) == 0;
+                    worst_rel = std::max(worst_rel, mx > 0 ? df / mx : df);
+                    (same ? n_ok : n_bad)++;
+                    std::fprintf(stderr, "ds4: GPU lane check: layer %d expert %d (%s) chunks %lld from the page cache, %lld from "
+                                         "the disk: slot vs blob %s; vs the CPU lane max |diff| %.3g of the largest output %.3g\n",
+                                 l.il, e, f.c_str(), (long long) via[pass][0], (long long) via[pass][1],
+                                 same ? "bit-identical" : "DIFFER", mx > 0 ? df / mx : df, mx);
+                }
+            }
+        }
+        std::fprintf(stderr, "ds4: GPU lane check: %d slot reads bit-identical to the blob, %d not (or failed); worst vs the CPU "
+                             "lane %.3g\n", n_ok, n_bad, worst_rel);
+        cudaFree(dx), cudaFree(dh), cudaFree(dsh), cudaFree(dout), cudaFree(dw), cudaFree(dplan);
+        cudaFreeHost(blob);
+#endif
+    }
+    // (serve_lane, a decode request on a GPU-lane layer) its CPU-lane picks that a slot takes: out of `picks`, their slots in
+    // the request's pull, which is published either way (the GPU's fetch waits for it)
+    void gl_take(const Layer& l, std::vector<std::pair<int, int>>& picks, unsigned seq) {
+        pcie::GlPull* P = gl_pull + seq % kRing;
+        for (int i = 0; i < pcie::kGlPicks; ++i) {
+            P->slot[i] = -1;
+            P->ptr[i] = 0ull;
+            P->gen[i] = 0u;
+        }
+        std::vector<std::pair<int, int>> keep;
+        for (const auto& pk_ : picks) {
+            const int e = pk_.first, i = pk_.second;
+            unsigned gen = 0;
+            const int s = i < l.k_exp && file_read(l, e) ? gl->demand(l.il, e, seq, &gen) : -1;
+            if (s < 0) {
+                keep.push_back(pk_);
+                continue;
+            }
+            P->slot[i] = s;
+            P->ptr[i] = (unsigned long long) gl->base(s);
+            P->gen[i] = gen;
+            ++st.stream_experts;
+        }
+        picks.swap(keep);
+        std::atomic_thread_fence(std::memory_order_release);
+        *(volatile unsigned*) &P->seq = seq;
     }
     void init_store() {
         const double gb = store_gb_now();
@@ -9374,6 +9653,9 @@ struct Model::Impl {
                     if (disk_skip_auto && j < g.nl && sk_auto.on.load(std::memory_order_relaxed) && !in_ram(n, e))
                         fl[e] |= 16;
                     if (store) store->prefetch(j, e);
+                    else if (gl && T == 1 && gl_ok[(size_t) j]) {
+                        if (a == 1 && i < gl_pf_n) gl->prefetch(j, e);
+                    }
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
                     ++st.ahead_pf;
@@ -9531,6 +9813,13 @@ struct Model::Impl {
                         ++st.ahead_rank_n[rk[e] - 1];
                         st.ahead_rank_hit[rk[e] - 1] += hit;
                     }
+                }
+                // the GPU lane (an integrated GPU): the picks go to pinned slots the GPU computes from - their reads first,
+                // then the lookahead's guesses behind them
+                if (gl) {
+                    gl->seen(next);
+                    gl->cancel_before(li);
+                    if (T == 1 && gl_ok[(size_t) li]) gl_take(l, picks, next);
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 // the PCIe lane (a decoded token on a layer that streams): the picks it takes leave the CPU lane's, their
@@ -14194,11 +14483,24 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
+                // the GPU lane (an integrated GPU): the device's experts' down first (the lane's slots may still be read),
+                // then the lane's picks as their slots fill - their gate / up and down over the lane's plan, in the lane's
+                // layout; the sum takes them as VRAM experts
+                const bool glon = gl && lead && nm == 1 && mx && lc < 0 && gl_ok[(size_t) l.il];
+                if (glon) {
+                    gg::moe_down_part(ma, d.xg, s);
+                    pcie::gl_fetch(gl_pull + slot, sq, gl_flags, d.plan_ptr, gl_plan2, l.k_exp, s);
+                    x3::MoeArgs m2 = ma;
+                    m2.plan_ptr = gl_plan2;
+                    m2.lay = gl_lay[(size_t) l.il];
+                    gg::moe_gate_up(m2, d.x, d.xg, s);
+                    gg::moe_down_part(m2, d.xg, s);
+                }
                 // the device's experts' down before the wait for the CPU lane (a GGUF layer that streams nothing: the lane's
                 // part is read only by the combine, so the same bits) - the GPU works while the lane computes, not after it.
                 // DS4_EARLY_DOWN=0: down after the wait, as before
                 static const bool early_dn = env_tri("DS4_EARLY_DOWN") != 0;
-                const bool early = early_dn && mx && lc < 0 && gg::moe_down_part(ma, d.xg, s);
+                const bool early = glon || (early_dn && mx && lc < 0 && gg::moe_down_part(ma, d.xg, s));
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
@@ -15049,6 +15351,27 @@ const Stats& Model::stats() const {
         st.store_zc_visible = (int64_t) x.visible_count();
         st.store_slots = (int64_t) x.slots_allocated();
         st.store_slots_max = (int64_t) x.slots_max();
+    }
+    if (p_->gl) {   // (the GPU lane's counters, likewise)
+        GpuLane::Stats& g = p_->gl->stats();
+        st.gl_demand = g.demand.load();
+        st.gl_ready = g.ready.load();
+        st.gl_filling = g.filling.load();
+        st.gl_missed = g.missed.load();
+        st.gl_no_slot = g.no_slot.load();
+        st.gl_pf = g.pf.load();
+        st.gl_pf_used = g.pf_used.load();
+        st.gl_pf_dropped = g.pf_dropped.load();
+        st.gl_ch_cache = g.ch_cache.load();
+        st.gl_ch_disk = g.ch_direct.load() + g.ch_buf.load();
+        st.gl_ch_fail = g.ch_fail.load();
+        st.gl_b_cache = g.b_cache.load();
+        st.gl_b_disk = g.b_disk.load();
+        st.gl_waited = g.waited.load();
+        st.gl_wait_us = g.wait_us.load();
+        st.gl_kicks = g.kicks.load();
+        st.gl_slow = g.slow.load();
+        st.gl_slow_us = g.slow_us.load();
     }
     return st;
 }
