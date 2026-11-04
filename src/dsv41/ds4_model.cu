@@ -108,12 +108,34 @@ int env_tri(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
 }
-// the decode layer's fused launches (A/B switches, off by default): DS4_FUSE=1 turns every one on, DS4_FUSE_<name>=1 / 0
-// one on / off whatever DS4_FUSE says.  DS4_FUSE_HC: hc_fused (hc_post + mix + split + pre-norm, two launches a layer
-// instead of six); DS4_FUSE_ROUTE: gate_route (the router and lookahead gates, their routes and the publish in one)
-bool fuse_on(const char* name) {
+// the measured defaults (DS4_FUSE_ROUTE, DS4_ROUTER_BF16): on where they were measured faster - a CUDA integrated GPU
+// (Jetson AGX Orin, DeepSeek V4.1 IQ1_M, 200 tokens cold, GPU lane on: 9.85 -> 10.15 tok/s together); off elsewhere until
+// measured there (an env turns each on or off)
+bool igpu_default() {
+#if defined(STRATA_USE_HIP) || defined(STRATA_METAL)
+    return false;
+#else
+    static const bool on = [] {
+        int dev = 0, integ = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        return integ != 0;
+    }();
+    return on;
+#endif
+}
+// the decode layer's fused launches: DS4_FUSE=1 / 0 turns every one on / off, DS4_FUSE_<name>=1 / 0 one whatever DS4_FUSE
+// says; neither set: dflt.  DS4_FUSE_HC: hc_fused (hc_post + mix + split + pre-norm, two launches a layer instead of six;
+// off by default: on the Orin -0.4 ms a token at the GPU-only ceiling and nothing measurable with the GPU lane on, and its
+// sums are not the separate launches' bits); DS4_FUSE_ROUTE: gate_route (the router and lookahead gates, their routes and
+// the publish in one; the same bits; on by default on an integrated GPU)
+bool fuse_on(const char* name, bool dflt) {
     const int own = env_tri(name);
-    return own >= 0 ? own == 1 : env_tri("DS4_FUSE") == 1;
+    if (own >= 0) return own == 1;
+    const int all = env_tri("DS4_FUSE");
+    return all >= 0 ? all == 1 : dflt;
 }
 
 double now_ms() {
@@ -2314,17 +2336,17 @@ struct Model::Impl {
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
     }
-    // the router's gate: F32 (f32), or with DS4_ROUTER_BF16=1 and a BF16 tensor in the pack its BF16 values as they are (half
+    // the router's gate: F32 (f32), or with DS4_ROUTER_BF16 and a BF16 tensor in the pack its BF16 values as they are (half
     // the memory and the bytes a gate GEMV reads; gemv_bf16w widens each exactly and sums in gemv_f32's order, so the same
-    // logits).  Not on Metal.
+    // logits).  On by default on an integrated GPU (igpu_default), DS4_ROUTER_BF16=0 / 1 off / on.  Not on Metal.
     bool gate_load(Dev& d, const std::string& name, Layer& l, std::string& err, size_t* acct) {
         const size_t n = (size_t) l.n_exp * g.dim;
 #if !defined(STRATA_METAL)
-        static const bool bf = env_tri("DS4_ROUTER_BF16") == 1;
+        static const bool bf = env_tri("DS4_ROUTER_BF16") >= 0 ? env_tri("DS4_ROUTER_BF16") == 1 : igpu_default();
         const Tensor* t = pk.get(name);
         if (bf && t != nullptr && t->dtype == "BF16" && t->bytes == n * 2 && g.dim % 4 == 0) {
             static bool said = false;
-            if (!said) std::fprintf(stderr, "ds4: DS4_ROUTER_BF16: the router gates stay BF16 on the device\n");
+            if (!said) std::fprintf(stderr, "ds4: the router gates stay BF16 on the device (DS4_ROUTER_BF16=0: widened to F32)\n");
             said = true;
             if (!dalloc(d, l.gate_w_bf, n, err, acct)) return false;
             return upload(d, *t, l.gate_w_bf, err) || (err = name + ": " + err, false);
@@ -14369,7 +14391,7 @@ struct Model::Impl {
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
         // attention
         // DS4_FUSE_HC: the mix, its split and the pre-norm (of the lagged pre) in one launch
-        static const bool fuse_hc = fuse_on("DS4_FUSE_HC");
+        static const bool fuse_hc = fuse_on("DS4_FUSE_HC", false);
         const bool fused_a = fuse_hc && hc_fused(nullptr, nullptr, nullptr, d.h, nullptr, l.hca_fn, D, H, (2 + H) * H, T,
                                                  g.eps, d.mix, d.hfpart, d.hfcnt, l.hca_scale, l.hca_base, g.sinkhorn,
                                                  g.hc_eps, d.a_pre, d.a_post, d.a_comb, nullptr, d.pre, l.attn_norm, d.x, s);
@@ -14477,7 +14499,7 @@ struct Model::Impl {
             const bool lead = mi == 0;
             // DS4_FUSE_ROUTE: the router's gate, the lookahead gates (the same ones as below), their routes and the
             // publish in one launch - the same logits, picks and request
-            static const bool fuse_route = fuse_on("DS4_FUSE_ROUTE");
+            static const bool fuse_route = fuse_on("DS4_FUSE_ROUTE", igpu_default());
             bool routed = false;
             if (fuse_route) {
                 GateSeg gs[3];
