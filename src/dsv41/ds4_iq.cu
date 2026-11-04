@@ -907,7 +907,7 @@ constexpr int kMaxJobs = 8;
 struct Jobs {
     MvJob j[kMaxJobs];
 };
-// STG (Q5_K, 16-byte aligned rows): the warp's next 2 x 4 super-blocks (1408 contiguous bytes) staged in shared memory
+// STG (Q5_K / Q4_K, 16-byte aligned rows): the warp's next 2 x 4 super-blocks (1408 / 1152 contiguous bytes) staged in shared memory
 // with coalesced 16-byte loads, each byte read once, then decoded from there as below - the same lane a sub-block, the
 // same math and order (bit-identical).  The plain kernel's lanes each read their sub-block's 4-byte words straight from
 // memory (the header and qh shared by 8 lanes): Jetson AGX Orin, the decode's Q5_K matrices, 108-133 GB/s -> 118-158 GB/s.
@@ -1342,7 +1342,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     }
 #endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
-    if constexpr (T == kQ5_K) {
+    if constexpr (T == kQ5_K || T == kQ4_K) {   // (Q4_K: 144-byte super-blocks, a 16-byte multiple too - dense_requant.py's overrides)
         static const bool plain = std::getenv("DS4_MV_PLAIN") != nullptr;   // (DS4_MV_PLAIN: the plain kernel, for A/B checks)
         bool aligned = !plain;
         for (int j = 0; j < nj && aligned; ++j) aligned = ((uintptr_t) J.j[j].w % 16) == 0 && J.j[j].ld % 16 == 0;
@@ -1350,7 +1350,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
         if (mv_log) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 400)
-                std::fprintf(stderr, "mv Q5_K: %d jobs, n %d k %d, w %% 16 = %d, ld %zu -> %s\n", nj, J.j[0].n, J.j[0].k,
+                std::fprintf(stderr, "mv %s: %d jobs, n %d k %d, w %% 16 = %d, ld %zu -> %s\n", T == kQ5_K ? "Q5_K" : "Q4_K", nj, J.j[0].n, J.j[0].k,
                              (int) ((uintptr_t) J.j[0].w % 16), J.j[0].ld, aligned ? "staged" : "plain");
         }
         if (aligned) {

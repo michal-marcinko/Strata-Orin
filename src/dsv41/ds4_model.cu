@@ -2161,8 +2161,10 @@ struct Model::Impl {
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols) {
         const bool q8 = t.dtype == "Q8_0";
-        // a ggml K-quant dense matrix (Q4_K / Q5_K / Q6_K: 256 values a block; the GEMV path of ds4_iq)
-        const int ggt = (t.dtype == "Q4_K" || t.dtype == "Q5_K" || t.dtype == "Q6_K") ? gg_type_of(t.dtype) : -1;
+        // a ggml K-quant dense matrix (Q3_K / Q4_K / Q5_K / Q6_K / IQ4_XS: 256 values a block; the GEMV path of ds4_iq -
+        // Q3_K / IQ4_XS: a dense_requant.py override)
+        const int ggt = (t.dtype == "Q4_K" || t.dtype == "Q5_K" || t.dtype == "Q6_K" || t.dtype == "Q3_K" || t.dtype == "IQ4_XS")
+                            ? gg_type_of(t.dtype) : -1;
         if (ggt > 0) return mat_gg(d, pre, t, ggt, m, err, acct, part, np, cols);
         if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
@@ -2225,7 +2227,8 @@ struct Model::Impl {
     // splits evenly, its groups only as wide as that goes)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0) {
-        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q4_K" || tw->dtype == "Q5_K" || tw->dtype == "Q6_K"))
+        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q4_K" || tw->dtype == "Q5_K" || tw->dtype == "Q6_K" ||
+                                                 tw->dtype == "Q3_K" || tw->dtype == "IQ4_XS"))
             return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
