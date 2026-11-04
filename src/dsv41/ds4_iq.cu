@@ -907,9 +907,15 @@ constexpr int kMaxJobs = 8;
 struct Jobs {
     MvJob j[kMaxJobs];
 };
-template <int T, int NC>
+// STG (Q5_K, 16-byte aligned rows): the warp's next 2 x 4 super-blocks (1408 contiguous bytes) staged in shared memory
+// with coalesced 16-byte loads, each byte read once, then decoded from there as below - the same lane a sub-block, the
+// same math and order (bit-identical).  The plain kernel's lanes each read their sub-block's 4-byte words straight from
+// memory (the header and qh shared by 8 lanes): Jetson AGX Orin, the decode's Q5_K matrices, 108-133 GB/s -> 118-158 GB/s.
+constexpr int kStgIter = 2;
+template <int T, int NC, bool STG = false>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ __align__(16) uint8_t stg[STG ? kWarps : 1][STG ? kStgIter * 4 * Ty<T>::B : 16];
     load_tab<T>(tab);
     __syncthreads();
     const MvJob& b = J.j[blockIdx.y];
@@ -920,6 +926,42 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
     float acc[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) acc[c] = 0.0f;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    if constexpr (STG) {
+        static_assert(Ty<T>::B % 16 == 0 && kQK<T> == 256, "staged GEMV: 16-byte multiple super-blocks of 256 values");
+        constexpr int kV = Ty<T>::B / 16, kMaxV = kStgIter * 4 * kV, kPer = (kMaxV + 31) / 32;
+        uint8_t* my = stg[threadIdx.x >> 5];
+        const int nsup = b.k / 256;
+        for (int kb0 = 0; kb0 < nsb; kb0 += 32 * kStgIter) {
+            const int s0 = kb0 >> 3, nv = min(kStgIter * 4, nsup - s0) * kV;
+            const uint4* src = (const uint4*) (w + (size_t) s0 * Ty<T>::B);
+            uint4 v[kPer];
+#pragma unroll
+            for (int i = 0; i < kPer; ++i)
+                if (lane + 32 * i < nv) v[i] = __ldg(src + lane + 32 * i);
+#pragma unroll
+            for (int i = 0; i < kPer; ++i)
+                if (lane + 32 * i < nv) ((uint4*) my)[lane + 32 * i] = v[i];
+            __syncwarp();
+            const uint8_t* base = my - (size_t) s0 * Ty<T>::B;   // (decode<> indexes from the row's start)
+#pragma unroll
+            for (int u = 0; u < kStgIter; ++u) {
+                const int kb = kb0 + 32 * u + lane;
+                if (kb < nsb) {
+                    Sub s;
+                    decode<T>(base, kb, tab, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (c < b.ncol) {
+                            const int4* xp = (const int4*) (b.xq + (size_t) c * b.k + (size_t) kb * 32);
+                            acc[c] = fmaf(b.xd[(size_t) c * nsb + kb], sub_dot<T>(s, xp[0], xp[1]), acc[c]);
+                        }
+                }
+            }
+            __syncwarp();
+        }
+    } else
+#endif
     for (int kb = lane; kb < nsb; kb += 32) {
         Sub s;
         decode<T>(w, kb, tab, s);
@@ -1297,6 +1339,25 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
             strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, K);
         }
         return;
+    }
+#endif
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    if constexpr (T == kQ5_K) {
+        static const bool plain = std::getenv("DS4_MV_PLAIN") != nullptr;   // (DS4_MV_PLAIN: the plain kernel, for A/B checks)
+        bool aligned = !plain;
+        for (int j = 0; j < nj && aligned; ++j) aligned = ((uintptr_t) J.j[j].w % 16) == 0 && J.j[j].ld % 16 == 0;
+        if (std::getenv("DS4_MV_LOG") != nullptr) {
+            static std::atomic<int> logged{0};
+            if (logged.fetch_add(1) < 400)
+                std::fprintf(stderr, "mv Q5_K: %d jobs, n %d k %d, w %% 16 = %d, ld %zu -> %s\n", nj, J.j[0].n, J.j[0].k,
+                             (int) ((uintptr_t) J.j[0].w % 16), J.j[0].ld, aligned ? "staged" : "plain");
+        }
+        if (aligned) {
+            if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1, true>, grid, kThreads, 0, s, J);
+            else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4, true>, grid, kThreads, 0, s, J);
+            else strata_ds4_launch(mv_kernel<T, 16, true>, grid, kThreads, 0, s, J);
+            return;
+        }
     }
 #endif
     if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
