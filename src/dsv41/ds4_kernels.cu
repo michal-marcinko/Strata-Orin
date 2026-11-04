@@ -503,6 +503,26 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
+// ... over the BF16 values the pack stores (DS4_ROUTER_BF16): a lane takes the same 4 values a step (8 bytes instead of 16),
+// widened exactly, in the same fmaf order - gemv_f32_kernel's sums bit for bit, half the bytes
+__device__ __forceinline__ float bf16w_dot4(uint2 q, float4 b, float acc) {
+    acc = fmaf(bf16f((uint16_t) (q.x & 0xffffu)), b.x, acc);
+    acc = fmaf(bf16f((uint16_t) (q.x >> 16)), b.y, acc);
+    acc = fmaf(bf16f((uint16_t) (q.y & 0xffffu)), b.z, acc);
+    return fmaf(bf16f((uint16_t) (q.y >> 16)), b.w, acc);
+}
+__global__ void __launch_bounds__(kThreads) gemv_bf16w_kernel(const uint16_t* __restrict__ W, const float* __restrict__ x,
+                                                              int n, int k, float* __restrict__ y, int ldy) {
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t = blockIdx.y;
+    if (row >= n) return;
+    const uint2* w = (const uint2*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) (x + (size_t) t * k);
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) acc = bf16w_dot4(w[c], xv[c], acc);
+    acc = warp_sum(acc);
+    if (lane == 0) y[(size_t) t * ldy + row] = acc;
+}
 
 // ---------------------------------------------------------------- the router
 // A pick that never came out: every score left is NaN (the gate's input went non-finite), so nothing beat -FLT_MAX and the
@@ -2181,6 +2201,7 @@ __global__ void __launch_bounds__(kThreads) hc_fused_kernel(const float* __restr
 // window is done the last of them publishes (publish_kernel's fences and order: na, T, then seq).
 struct GateSegK {
     const float* W;
+    const uint16_t* Wb;   // (DS4_ROUTER_BF16: the BF16 values instead of W; gemv_bf16w_kernel's row)
     const float* bias;
     float* y;
     int n, nb, m, off;
@@ -2260,15 +2281,20 @@ __global__ void __launch_bounds__(kThreads) gate_route_kernel(const float* __res
         const int row = b * (kThreads / 32) + (threadIdx.x >> 5);
         const int lane = threadIdx.x & 31;
         if (row < S.n) {
-            const float4* wr = (const float4*) (S.W + (size_t) row * p.k);
             const float4* xv = (const float4*) (x + (size_t) t * p.k);
             float acc = 0.0f;
-            for (int c = lane; c < p.k / 4; c += 32) {
-                const float4 a = wr[c], bb = xv[c];
-                acc = fmaf(a.x, bb.x, acc);
-                acc = fmaf(a.y, bb.y, acc);
-                acc = fmaf(a.z, bb.z, acc);
-                acc = fmaf(a.w, bb.w, acc);
+            if (S.Wb != nullptr) {
+                const uint2* wb = (const uint2*) (S.Wb + (size_t) row * p.k);
+                for (int c = lane; c < p.k / 4; c += 32) acc = bf16w_dot4(wb[c], xv[c], acc);
+            } else {
+                const float4* wr = (const float4*) (S.W + (size_t) row * p.k);
+                for (int c = lane; c < p.k / 4; c += 32) {
+                    const float4 a = wr[c], bb = xv[c];
+                    acc = fmaf(a.x, bb.x, acc);
+                    acc = fmaf(a.y, bb.y, acc);
+                    acc = fmaf(a.z, bb.z, acc);
+                    acc = fmaf(a.w, bb.w, acc);
+                }
             }
             acc = warp_sum(acc);
             if (lane == 0) S.y[(size_t) t * p.ldy + row] = acc;
@@ -2519,11 +2545,12 @@ bool gate_route(const float* x, int k, int T, const GateSeg* seg, int nseg, int 
     int nb = 0;
     for (int i = 0; i < nseg; ++i) {
         const GateSeg& sgi = seg[i];
-        if (sgi.W == nullptr || sgi.bias == nullptr || sgi.y == nullptr || sgi.n < 1 || sgi.n > 1024 ||
-            ((size_t) sgi.W & 15u) != 0)
+        if ((sgi.W == nullptr && sgi.Wb == nullptr) || sgi.bias == nullptr || sgi.y == nullptr || sgi.n < 1 ||
+            sgi.n > 1024 || ((size_t) sgi.W & 15u) != 0 || ((size_t) sgi.Wb & 7u) != 0)
             return false;
         if (i > 0 && (sgi.m < 1 || sgi.m > 16 || sgi.off < 0 || sgi.off + sgi.m > kAhead)) return false;
         p.seg[i].W = sgi.W;
+        p.seg[i].Wb = sgi.Wb;
         p.seg[i].bias = sgi.bias;
         p.seg[i].y = sgi.y;
         p.seg[i].n = sgi.n;
@@ -2728,6 +2755,14 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
     if (T > 0 && ::strata::dsv41::metal_host::gemv_f32(W, x, n, k, T, y, ldy)) return;
 #endif
     if (T > 0) strata_ds4_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
+}
+void gemv_bf16w(const uint16_t* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    (void) W; (void) x; (void) n; (void) k; (void) T; (void) y; (void) ldy; (void) s;
+    std::fprintf(stderr, "ds4 gemv_bf16w: not on Metal (the loader keeps the router F32 there)\n");
+#else
+    if (T > 0) strata_ds4_launch(gemv_bf16w_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
+#endif
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,

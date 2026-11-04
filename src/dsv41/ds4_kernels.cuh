@@ -106,6 +106,9 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// gemv_f32 over BF16 weights (DS4_ROUTER_BF16: the router as the pack stores it): each value widened exactly and summed in
+/// gemv_f32's order, so its bits, from half the bytes (k % 4 == 0, W 8-byte aligned).  Not on Metal.
+void gemv_bf16w(const uint16_t* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -260,6 +263,7 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 /// nothing launched, where it does not apply (T > kWin, n > 1024, m > 16, misaligned, Metal).
 struct GateSeg {
     const float* W = nullptr;      // [n][k] F32
+    const uint16_t* Wb = nullptr;  // ... or [n][k] BF16 (DS4_ROUTER_BF16, gemv_bf16w's sums) - the one used when given
     const float* bias = nullptr;   // n
     float* y = nullptr;            // the logits, rows ldy apart
     int n = 0;
