@@ -14,7 +14,7 @@
 //
 // Threads: demand(), prefetch(), seen(), cancel_before() from the service thread alone (it owns the slot table); the readers
 // touch a slot's counters and flag only.  A slot the GPU may still read (used by request seq, not yet seen past) is not
-// given up.  DS4_GL=1 turns the lane on (ds4_model.cu).
+// given up.  On by default on an integrated GPU, DS4_GL=0 off (ds4_model.cu init_gl).
 #pragma once
 
 #include <algorithm>
@@ -104,7 +104,7 @@ public:
         slots_.reset(new Slot[(size_t) c.slots]);
         where_.resize(geo_.size());
         for (size_t l = 0; l < geo_.size(); ++l) where_[l].assign(1024, -1);
-        for (int i = 0; i < c.slots; ++i) flags_[i] = 0u;
+        for (int i = 0; i < 2 * c.slots; ++i) flags_[i] = 0u;
         const int nt = std::max(1, c.threads);
         rd_.reset(new Reader[(size_t) nt]);
         for (int t = 0; t < nt; ++t) {
@@ -208,7 +208,10 @@ public:
         slots_[(size_t) s].pf = false;
         fill(s, layer, e, true);
         while (slots_[(size_t) s].state.load(std::memory_order_acquire) == kFilling) std::this_thread::yield();
-        return slots_[(size_t) s].state.load() == kReady && flags_[s] == slots_[(size_t) s].gen ? s : -1;
+        return slots_[(size_t) s].state.load() == kReady && flags_[2 * s] == slots_[(size_t) s].gen &&
+                       flags_[2 * s + 1] == slots_[(size_t) s].gen
+                   ? s
+                   : -1;
     }
     /// Guesses for layers before `layer` (the token has passed them) whose reads have not started: dropped
     void cancel_before(int layer) {
@@ -228,6 +231,8 @@ public:
             Slot& sp = slots_[(size_t) s];
             ++st_.pf_dropped;
             sp.left.store(0);
+            sp.part_left[0].store(0);
+            sp.part_left[1].store(0);
             sp.state.store(kFree, std::memory_order_release);
             where_[(size_t) sp.layer][(size_t) sp.e] = -1;
             sp.layer = sp.e = -1;
@@ -241,13 +246,15 @@ private:
         unsigned gen = 0;
         std::atomic<int> state{kFree};
         std::atomic<int> left{0}, started{0}, bad{0};
+        std::atomic<int> part_left[2] = {{0}, {0}};   // chunks of the gate / up, of the down still to come
+        std::atomic<int> part_bad[2] = {{0}, {0}};
         std::atomic<int64_t> asked{0};   // (us) when a request asked for it before its fill was done (0: not)
         unsigned pin = 0;          // the last request that uses it (the GPU may read it until a later one is seen)
         uint64_t touch = 0;
         bool pf = false, used = false;
     };
     struct Job {
-        int slot = 0;
+        int slot = 0, part = 0;   // part 0: the gate / up, 1: the down
         unsigned gen = 0;
         int file = 0;
         uint64_t off = 0, len = 0, need = 0;   // file offset (aligned), the read's length, the bytes it must deliver
@@ -303,6 +310,7 @@ private:
             for (uint64_t at = 0; at < g.rlen[r]; at += cfg_.chunk) {
                 Job j;
                 j.slot = s;
+                j.part = r < 2 ? 0 : 1;
                 j.gen = sp.gen;
                 j.file = g.file[r];
                 j.off = a0 + at;
@@ -315,6 +323,12 @@ private:
         }
         sp.bad.store(0, std::memory_order_relaxed);
         sp.started.store(0, std::memory_order_relaxed);
+        int np[2] = {0, 0};
+        for (const Job& j : js) ++np[j.part];
+        for (int q = 0; q < 2; ++q) {
+            sp.part_left[q].store(np[q], std::memory_order_relaxed);
+            sp.part_bad[q].store(0, std::memory_order_relaxed);
+        }
         sp.left.store((int) js.size(), std::memory_order_relaxed);
         sp.state.store(kFilling, std::memory_order_release);
         {
@@ -411,12 +425,17 @@ private:
         if (!ok) {
             ++st_.ch_fail;
             sp.bad.store(1, std::memory_order_relaxed);
+            sp.part_bad[j.part].store(1, std::memory_order_relaxed);
+        }
+        // the part's last chunk: its flag (the GPU computes the gate / up while the down is still being read)
+        if (sp.part_left[j.part].fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            const bool pb = sp.part_bad[j.part].load(std::memory_order_relaxed) != 0;
+            std::atomic_thread_fence(std::memory_order_release);
+            flags_[2 * j.slot + j.part] = pb ? (j.gen | kBad) : j.gen;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
         }
         if (sp.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             const bool bad = sp.bad.load(std::memory_order_relaxed) != 0;
-            std::atomic_thread_fence(std::memory_order_release);
-            flags_[j.slot] = bad ? (j.gen | kBad) : j.gen;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
             sp.state.store(bad ? kBadFill : kReady, std::memory_order_release);
             const int64_t a = sp.asked.exchange(0);
             if (a > 0) {

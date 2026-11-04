@@ -160,13 +160,16 @@ struct GlPull {
     unsigned gen[kGlPicks];
     int slot[kGlPicks];
 };
-// one thread: the pull, then each pick's slot flag; plan2[i] = the slot (0: none), plan[i] too (the down pass and the
-// sum take it as a VRAM expert).  Gives up after 20 s (a host that never answers: the pick left out, no hang for good)
+// one thread: the pull, then each pick's slot flags - flags[2 s] its gate / up read, flags[2 s + 1] its down.  part 0: once
+// the gate / up is in, plan2[i] = the slot (0: none / failed); part 1: once the down is in too, plan[i] = the slot (the
+// down pass and the sum take it as a VRAM expert), else plan2[i] = 0 (left out).  Gives up after 20 s (a host that never
+// answers: the pick left out, no hang for good)
 __global__ void gl_fetch_kernel(const GlPull* p, unsigned seq, const unsigned* flags, unsigned long long* plan,
-                                unsigned long long* plan2, int k) {
+                                unsigned long long* plan2, int k, int part) {
     if (threadIdx.x != 0) return;
     volatile const GlPull* vp = (volatile const GlPull*) p;
     volatile const unsigned* vf = (volatile const unsigned*) flags;
+    volatile unsigned long long* vp2 = (volatile unsigned long long*) plan2;
     const unsigned long long t0 = pull_clock(), lim = 20000000000ull;
     bool late = false;
     while (vp->seq != seq) {
@@ -180,10 +183,10 @@ __global__ void gl_fetch_kernel(const GlPull* p, unsigned seq, const unsigned* f
     for (int i = 0; i < k; ++i) {
         unsigned long long d = 0ull;
         const int s = late ? -1 : vp->slot[i];
-        if (s >= 0) {
+        if (s >= 0 && (part == 0 || vp2[i] != 0ull)) {
             const unsigned g = vp->gen[i];
             for (;;) {
-                const unsigned f = vf[s];
+                const unsigned f = vf[2 * s + part];
                 if (f == g) {
                     d = vp->ptr[i];
                     break;
@@ -192,14 +195,15 @@ __global__ void gl_fetch_kernel(const GlPull* p, unsigned seq, const unsigned* f
                 pull_nap();
             }
         }
-        plan2[i] = d;
-        if (d != 0ull) plan[i] = d;
+        if (part == 0) vp2[i] = d;
+        else if (d != 0ull) plan[i] = d;
+        else vp2[i] = 0ull;
     }
     __threadfence_system();
 }
 inline void gl_fetch(const GlPull* p, unsigned seq, const unsigned* flags, unsigned long long* plan,
-                     unsigned long long* plan2, int k, cudaStream_t s) {
-    strata_ds4_launch(gl_fetch_kernel, 1, 32, 0, s, p, seq, flags, plan, plan2, k);
+                     unsigned long long* plan2, int k, int part, cudaStream_t s) {
+    strata_ds4_launch(gl_fetch_kernel, 1, 32, 0, s, p, seq, flags, plan, plan2, k, part);
 }
 
 inline void stream_fetch(Pull* p, unsigned seq, unsigned* dflag, uint8_t* vram, size_t stride, const Mats& m,

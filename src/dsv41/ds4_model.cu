@@ -1424,10 +1424,11 @@ struct Model::Impl {
     std::vector<uint8_t> gl_ok;                 // [layer]: its decode picks go to the GPU lane
     std::vector<x3::ExpertLayout> gl_lay;       // [layer]: its experts' layout in a lane slot
     pcie::GlPull* gl_pull = nullptr;            // host-mapped [kRing]
-    unsigned* gl_flags = nullptr;               // host-mapped [slots]
+    unsigned* gl_flags = nullptr;               // host-mapped [2 slots]: each slot's gate / up read, its down read
     unsigned long long* gl_plan2 = nullptr;     // device [kPicks]: the lane's picks' plan (their gate / up and down)
     uint8_t* gl_slab = nullptr;                 // host-mapped: the slots
     int gl_pf_n = 16;                           // DS4_GL_PF_N: the next layer's guesses read ahead, by rank (the best n)
+    int gl_pf_n2 = 8;                           // DS4_GL_PF_N2: the layer after's (DS4_AHEAD=2)
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -6550,16 +6551,18 @@ struct Model::Impl {
                          (double) avail / 1e9, now, gb);
         return std::min(gb, now);
     }
-    // the GPU lane (ds4_gpulane.hpp): DS4_GL=1 on an integrated GPU (one device, the decode's async path, no RAM store, no
-    // stream lane); DS4_GL_SLOTS (32), DS4_GL_THREADS (6 readers), DS4_GL_CHUNK_KB (1024), DS4_GL_DIRECT=0 (misses read
+    // the GPU lane (ds4_gpulane.hpp): on by default on an integrated GPU (one device, the decode's async path, no RAM store,
+    // no stream lane; measured on a Jetson AGX Orin: 7.9 -> 9.5 tok/s cold), DS4_GL=0 off; DS4_GL_SLOTS (64), DS4_GL_THREADS (6 readers), DS4_GL_CHUNK_KB (1024), DS4_GL_DIRECT=0 (misses read
     // buffered, the page cache keeps them; default unbuffered), DS4_GL_FORCE=1 (a discrete GPU too: it reads the slots over
     // PCIe - tests)
     bool init_gl(std::string& err) {
 #if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
-        if (env_tri("DS4_GL") <= 0) return true;
+        const int want = env_tri("DS4_GL");
+        if (want == 0) return true;
         const char* why = nullptr;
         int integ = 0;
         if (!devs.empty() && cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, devs[0].id) != cudaSuccess) cudaGetLastError();
+        if (want < 0 && !integ) return true;   // (on by default on an integrated GPU alone)
         if (!pk.gguf) why = "not a GGUF";
         else if (!moe_token_path || sync_decode) why = "not the async token path";
         else if (store) why = "the RAM store is on";
@@ -6599,7 +6602,7 @@ struct Model::Impl {
             return true;
         }
         GpuLane::Cfg c;
-        c.slots = std::max(8, std::min(256, (int) env_f("DS4_GL_SLOTS", 32.0f)));
+        c.slots = std::max(8, std::min(256, (int) env_f("DS4_GL_SLOTS", 64.0f)));
         c.threads = std::max(1, std::min(16, (int) env_f("DS4_GL_THREADS", 6.0f)));
         c.chunk = (uint64_t) std::max(64, std::min(16384, (int) env_f("DS4_GL_CHUNK_KB", 1024.0f))) << 10;
         c.direct = env_tri("DS4_GL_DIRECT") != 0;
@@ -6623,10 +6626,11 @@ struct Model::Impl {
             }
         }
         gl_pf_n = std::max(0, (int) env_f("DS4_GL_PF_N", 16.0f));
+        gl_pf_n2 = std::max(0, (int) env_f("DS4_GL_PF_N2", 8.0f));
         Dev& d = devs[0];
         cudaSetDevice(d.id);
         if (!hmap(gl_slab, (size_t) c.slots * stride, err) || !hmap(gl_pull, (size_t) kRing, err) ||
-            !hmap(gl_flags, (size_t) c.slots, err) || !dalloc(d, gl_plan2, kPicks, err))
+            !hmap(gl_flags, (size_t) 2 * c.slots, err) || !dalloc(d, gl_plan2, kPicks, err))
             return false;
         void* hd = nullptr;
         if (cudaHostGetDevicePointer(&hd, gl_slab, 0) != cudaSuccess || hd != (void*) gl_slab) {
@@ -9654,7 +9658,7 @@ struct Model::Impl {
                         fl[e] |= 16;
                     if (store) store->prefetch(j, e);
                     else if (gl && T == 1 && gl_ok[(size_t) j]) {
-                        if (a == 1 && i < gl_pf_n) gl->prefetch(j, e);
+                        if (i < (a == 1 ? gl_pf_n : gl_pf_n2)) gl->prefetch(j, e);
                     }
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
@@ -14489,11 +14493,15 @@ struct Model::Impl {
                 const bool glon = gl && lead && nm == 1 && mx && lc < 0 && gl_ok[(size_t) l.il];
                 if (glon) {
                     gg::moe_down_part(ma, d.xg, s);
-                    pcie::gl_fetch(gl_pull + slot, sq, gl_flags, d.plan_ptr, gl_plan2, l.k_exp, s);
                     x3::MoeArgs m2 = ma;
                     m2.plan_ptr = gl_plan2;
                     m2.lay = gl_lay[(size_t) l.il];
+                    // (DS4_GL_SPLIT=0: every matrix of the picks read before their gate / up starts)
+                    static const bool gl_split = env_tri("DS4_GL_SPLIT") != 0;
+                    pcie::gl_fetch(gl_pull + slot, sq, gl_flags, d.plan_ptr, gl_plan2, l.k_exp, 0, s);
+                    if (!gl_split) pcie::gl_fetch(gl_pull + slot, sq, gl_flags, d.plan_ptr, gl_plan2, l.k_exp, 1, s);
                     gg::moe_gate_up(m2, d.x, d.xg, s);
+                    if (gl_split) pcie::gl_fetch(gl_pull + slot, sq, gl_flags, d.plan_ptr, gl_plan2, l.k_exp, 1, s);
                     gg::moe_down_part(m2, d.xg, s);
                 }
                 // the device's experts' down before the wait for the CPU lane (a GGUF layer that streams nothing: the lane's
