@@ -1391,9 +1391,11 @@ struct Model::Impl {
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
     // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
-    const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
-                c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
-    const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
+    // (c_bonus, c_inflight: the GPU lane's own defaults when it is on - init_gl)
+    const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f);
+    float c_bonus = env_f("DS4_CACHE_BONUS", 1.0f);
+    const float c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
+    int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
     // the RAM tier (a GGUF's in-place experts, as GLM's: the hottest in VRAM, the next hottest here, the coldest in the
     // files): RAM slots of one expert blob each, filled at load with the hottest experts VRAM does not hold, so the
     // CPU lane reads them from RAM; between windows (cache_tick) a hotter expert from the files takes the place of the
@@ -1465,6 +1467,8 @@ struct Model::Impl {
     int gl_pf_n = 16;                           // DS4_GL_PF_N: the next layer's guesses read ahead, by rank (the best n)
     int gl_pf_n2 = 8;                           // DS4_GL_PF_N2: the layer after's (DS4_AHEAD=2)
     int gl_pf_mid = 16;                         // DS4_GL_PF_MID: of the next layer's, the best n read before the rest
+    int gl_swap_slot = 0;                       // DS4_GL_SWAP_SLOT (init_gl): the expert cache's moves from the lane's slots
+    int gl_cancel = 0;                          // DS4_GL_CANCEL (init_gl): a layer's wrong guesses dropped once its picks are known
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -6722,6 +6726,25 @@ struct Model::Impl {
         auto lane = std::make_unique<GpuLane>();
         lane->init(c, geo, files, gl_slab, stride, gl_flags);
         gl = std::move(lane);
+        // The lane's defaults for the expert cache and the guesses (measured on a Jetson AGX Orin, 200-token essay / code
+        // decodes, cold: 10.1 -> 10.8 / 9.5 -> 10.3 tok/s; .superpowers/research/ssd-predict-results.md):
+        // - DS4_GL_SWAP_SLOT (1): a move into VRAM copies the expert from the lane's slot when one holds it (it was just read
+        //   there; ~90% of a decode's moves) - before, each move read it again from the file, buffered, on the mover thread
+        //   (~7.5 MB of SSD reads competing with the lane's); the file still when no slot has it (a prompt's moves, the
+        //   settle after it, the idle's).  2: such a move left out instead (a decode measures the same; the settles then
+        //   move nothing); 0: always the file.
+        // - DS4_GL_CANCEL (2): once a layer's request names its picks, its guesses that were not picked are dropped (not
+        //   started) or cut short (part read) - ~45% of the guesses are wrong.  1: only the unstarted ones; 0: off.
+        // - the expert cache follows the conversation faster: DS4_CACHE_INFLIGHT 40 moves under way (was 8 - the cap that
+        //   held it to ~6 moves a token), DS4_CACHE_BONUS 0.5 (was 1), DS4_CACHE_PRIOR 64 (the profile's starting heat a
+        //   layer, was 512).  Lane picks a token 25 -> 16.5.
+        gl_swap_slot = std::max(0, std::getenv("DS4_GL_SWAP_SLOT") ? std::atoi(std::getenv("DS4_GL_SWAP_SLOT")) : 1);
+        gl_cancel = std::max(0, std::getenv("DS4_GL_CANCEL") ? std::atoi(std::getenv("DS4_GL_CANCEL")) : 2);
+        if (std::getenv("DS4_CACHE_INFLIGHT") == nullptr) c_inflight = 40;
+        if (std::getenv("DS4_CACHE_BONUS") == nullptr) c_bonus = 0.5f;
+        if (std::getenv("DS4_CACHE_PRIOR") == nullptr)   // (the heat place_experts started from the profile at 512 a layer)
+            for (Layer& l : L)
+                for (float& h : l.heat) h *= 64.0f / 512.0f;
         if (env_tri("DS4_GL_STATS") > 0) {   // (the per-layer table at exit, or when the lane goes)
             GpuLane::reporter().store(gl.get());
             std::atexit([] { if (GpuLane* r = GpuLane::reporter().exchange(nullptr)) r->report(); });
@@ -9000,7 +9023,7 @@ struct Model::Impl {
         // the files again)
         // DS4_GL_SWAP_SLOT=2: from a slot only - a move whose expert no slot holds any more is left out (no file read
         // competing with the lane's)
-        static const int from_slot = std::max(0, env_tri("DS4_GL_SWAP_SLOT"));
+        const int from_slot = gl_swap_slot;
         size_t at[3] = {l.lay.trellis[0], l.lay.trellis[1], l.lay.trellis[2]};
         const bool lane_l = !copy_mode && from_slot > 0 && gl && l.il < (int) gl_ok.size() && gl_ok[(size_t) l.il];
         const bool got_slot = lane_l && gl->copy_out(l.il, sw.in, sw_a, at);
@@ -9939,7 +9962,6 @@ struct Model::Impl {
                         gl_take(l, picks, next, fl);
                         // DS4_GL_CANCEL: this layer's picks are known - its guesses not asked for are wrong: 1 those not
                         // started dropped, 2 also those part read cut short (their bandwidth for the next layers' reads)
-                        static const int gl_cancel = (int) env_f("DS4_GL_CANCEL", 0.0f);
                         if (gl_cancel > 0) gl->cancel_before(li + 1, gl_cancel >= 2);
                     }
                 }
