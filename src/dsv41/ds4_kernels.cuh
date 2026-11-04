@@ -117,8 +117,17 @@ constexpr int kVlRows = 8192;
 struct VlBits {
     uint32_t w[kVlRows / 32];
 };
+/// DS4_CAR_LAMBDA (lossy, opt-in; DS4_CAR_J the router's own picks first, default 2): the selection's cache-aware bias
+/// toward the experts the layer's VRAM table vram holds (ds4_kernels.cu car_boost).  vram null: never biased
+struct Car {
+    const unsigned long long* vram = nullptr;
+    float lam = 0.0f;
+    int j = 2;
+};
+/// the routing's Car for a layer's VRAM table (lam from DS4_CAR_LAMBDA, 0 when unset: off)
+Car car_of(const unsigned long long* vram);
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr);
+           cudaStream_t s, const float* bias_vl = nullptr, const VlBits* vl = nullptr, const unsigned long long* vram = nullptr);
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
@@ -255,13 +264,15 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    unsigned vl = 0, int na0 = 0, int na1 = 0);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 const unsigned long long* vram = nullptr);
 /// DS4_FUSE (the decode layer): gemv_f32 of the router's gate (seg[0]) and of up to two lookahead gates (seg[1], seg[2])
 /// on x [T][k], then route_publish of seg[0] (kp picks; vram, idx, w, plan_ptr, req, bias_vl, vl as route_publish's),
 /// route_ahead of the others (req->ahead[t][off ..)) and, req given, the publish (na0, na1, T, then seq) - one launch,
 /// the same logits and the same picks as those launches.  cnt: kGateRouteCnt zeroed counters (left zero).  False,
 /// nothing launched, where it does not apply (T > kWin, n > 1024, m > 16, misaligned, Metal).
 struct GateSeg {
+    const unsigned long long* vram = nullptr;   // (a lookahead segment: its layer's VRAM table, DS4_CAR_LAMBDA's)
     const float* W = nullptr;      // [n][k] F32
     const uint16_t* Wb = nullptr;  // ... or [n][k] BF16 (DS4_ROUTER_BF16, gemv_bf16w's sums) - the one used when given
     const float* bias = nullptr;   // n

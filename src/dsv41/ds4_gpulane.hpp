@@ -69,11 +69,25 @@ public:
     };
     struct Stats {
         std::atomic<int64_t> demand{0}, ready{0}, filling{0}, missed{0}, no_slot{0};
-        std::atomic<int64_t> pf{0}, pf_used{0}, pf_dropped{0};
+        std::atomic<int64_t> pf{0}, pf_used{0}, pf_dropped{0}, pf_cut{0};
         std::atomic<int64_t> ch_cache{0}, ch_direct{0}, ch_buf{0}, ch_fail{0};
         std::atomic<int64_t> b_cache{0}, b_disk{0};
         std::atomic<int64_t> waited{0}, wait_us{0};   // picks not ready when asked, their wait from the ask to the fill's end
         std::atomic<int64_t> kicks{0}, slow{0}, slow_us{0};   // kicks sent; reads that took > 50 ms, their time
+        std::atomic<int64_t> copied_out{0};   // experts the expert cache's mover took from a slot (not the files)
+    };
+    // DS4_GL_STATS=1: where the lane's picks came from, a layer at a time (printed at exit).  A pick, when its request asks:
+    // ready (a guess for it, or a slot an earlier request filled), a guess still queued / being read, not held though a guess
+    // was made (no slot, dropped, or given up), or never guessed
+    static constexpr int kStatL = 64;
+    struct LStats {
+        std::atomic<int64_t> demand{0}, ready_guess{0}, ready_reuse{0}, fill_q{0}, fill_r{0}, miss_g{0}, miss_u{0};
+        std::atomic<int64_t> waited{0}, wait_us{0};       // picks asked before their fill was done, their wait
+        std::atomic<int64_t> pf{0}, pf_used{0}, pf_wasted{0};   // guesses read ahead; asked for; read and given up unasked
+        std::atomic<int64_t> pf_dropped{0}, pf_cut{0};          // guesses dropped before their read started, part read
+        std::atomic<int64_t> lead_n{0}, lead_us{0};       // guesses asked while still filling: their time from the guess to the ask
+        std::atomic<int64_t> qwait_n{0}, qwait_us{0};     // fills: from the fill's queueing to its first read starting
+        std::atomic<int64_t> rd_n{0}, rd_us{0};           // fills: from the first read starting to the last one's end
     };
 
     // the slot geometry: each layer's regions (null geo: none); returns the slot bytes needed (0: no layer fits)
@@ -117,7 +131,13 @@ public:
         }
         return true;
     }
+    static std::atomic<GpuLane*>& reporter() {
+        static std::atomic<GpuLane*> r{nullptr};
+        return r;
+    }
     ~GpuLane() {
+        GpuLane* me = this;
+        if (reporter().compare_exchange_strong(me, nullptr)) report();
         {
             std::lock_guard<std::mutex> lk(mu_);
             quit_ = true;
@@ -136,6 +156,48 @@ public:
     uint8_t* base(int s) const { return slab_ + (size_t) s * stride_; }
     const Geo& geo(int layer) const { return geo_[(size_t) layer]; }
     Stats& stats() { return st_; }
+    LStats& lst(int layer) { return lst_[(size_t) std::max(0, std::min(kStatL - 1, layer))]; }
+    void stats_on(bool v) { stats_on_ = v; }
+    /// DS4_GL_STATS: the per-layer table (stderr)
+    void report() {
+        std::fprintf(stderr, "GPU lane by layer: picks | ready: guess, reuse | still filling: queued, reading | not held: guessed, "
+                             "unguessed | waited, ms each | guesses: read, used, wasted (read, never asked), dropped unread, cut part read | guess lead ms (filling) | queue ms, read ms\n");
+        LStats t;
+        auto add = [](std::atomic<int64_t>& a, const std::atomic<int64_t>& b) { a += b.load(); };
+        for (int l = 0; l < kStatL; ++l) {
+            LStats& x = lst_[(size_t) l];
+            if (x.demand.load() == 0 && x.pf.load() == 0) continue;
+            const double d = std::max<double>(1.0, (double) x.demand.load());
+            std::fprintf(stderr, "GL L%02d %6lld | %5.1f%% %5.1f%% | %5.1f%% %5.1f%% | %5.1f%% %5.1f%% | %6lld %.2f | %6lld %5.1f%% %5.1f%% %5.1f%% %5.1f%% | %.2f | %.2f %.2f\n",
+                         l, (long long) x.demand.load(), 100 * x.ready_guess.load() / d, 100 * x.ready_reuse.load() / d,
+                         100 * x.fill_q.load() / d, 100 * x.fill_r.load() / d, 100 * x.miss_g.load() / d, 100 * x.miss_u.load() / d,
+                         (long long) x.waited.load(), x.waited.load() ? x.wait_us.load() / 1e3 / x.waited.load() : 0.0,
+                         (long long) x.pf.load(), 100.0 * x.pf_used.load() / std::max<int64_t>(1, x.pf.load()),
+                         100.0 * x.pf_wasted.load() / std::max<int64_t>(1, x.pf.load()),
+                         100.0 * x.pf_dropped.load() / std::max<int64_t>(1, x.pf.load()),
+                         100.0 * x.pf_cut.load() / std::max<int64_t>(1, x.pf.load()),
+                         x.lead_n.load() ? x.lead_us.load() / 1e3 / x.lead_n.load() : 0.0,
+                         x.qwait_n.load() ? x.qwait_us.load() / 1e3 / x.qwait_n.load() : 0.0,
+                         x.rd_n.load() ? x.rd_us.load() / 1e3 / x.rd_n.load() : 0.0);
+            add(t.demand, x.demand), add(t.ready_guess, x.ready_guess), add(t.ready_reuse, x.ready_reuse), add(t.fill_q, x.fill_q);
+            add(t.fill_r, x.fill_r), add(t.miss_g, x.miss_g), add(t.miss_u, x.miss_u), add(t.waited, x.waited), add(t.wait_us, x.wait_us);
+            add(t.pf, x.pf), add(t.pf_used, x.pf_used), add(t.pf_wasted, x.pf_wasted), add(t.pf_dropped, x.pf_dropped), add(t.pf_cut, x.pf_cut), add(t.lead_n, x.lead_n), add(t.lead_us, x.lead_us);
+            add(t.qwait_n, x.qwait_n), add(t.qwait_us, x.qwait_us), add(t.rd_n, x.rd_n), add(t.rd_us, x.rd_us);
+        }
+        const double d = std::max<double>(1.0, (double) t.demand.load());
+        std::fprintf(stderr, "GL: %lld experts the expert cache moved into VRAM came from a slot\n", (long long) st_.copied_out.load());
+        std::fprintf(stderr, "GL all %6lld | %5.1f%% %5.1f%% | %5.1f%% %5.1f%% | %5.1f%% %5.1f%% | %6lld %.2f | %6lld %5.1f%% %5.1f%% %5.1f%% %5.1f%% | %.2f | %.2f %.2f\n",
+                     (long long) t.demand.load(), 100 * t.ready_guess.load() / d, 100 * t.ready_reuse.load() / d,
+                     100 * t.fill_q.load() / d, 100 * t.fill_r.load() / d, 100 * t.miss_g.load() / d, 100 * t.miss_u.load() / d,
+                     (long long) t.waited.load(), t.waited.load() ? t.wait_us.load() / 1e3 / t.waited.load() : 0.0,
+                     (long long) t.pf.load(), 100.0 * t.pf_used.load() / std::max<int64_t>(1, t.pf.load()),
+                     100.0 * t.pf_wasted.load() / std::max<int64_t>(1, t.pf.load()),
+                     100.0 * t.pf_dropped.load() / std::max<int64_t>(1, t.pf.load()),
+                     100.0 * t.pf_cut.load() / std::max<int64_t>(1, t.pf.load()),
+                     t.lead_n.load() ? t.lead_us.load() / 1e3 / t.lead_n.load() : 0.0,
+                     t.qwait_n.load() ? t.qwait_us.load() / 1e3 / t.qwait_n.load() : 0.0,
+                     t.rd_n.load() ? t.rd_us.load() / 1e3 / t.rd_n.load() : 0.0);
+    }
 
     /// The GPU has passed every request before seq (the service thread saw request seq published: the device's stream
     /// ran everything enqueued before it)
@@ -143,8 +205,10 @@ public:
 
     /// (layer, e) for request seq: its slot (a fill started now if it holds nothing, at the front of the queue), pinned for
     /// the request; *gen the flag value the GPU waits for.  -1: no slot free (the CPU lane computes it)
-    int demand(int layer, int e, unsigned seq, unsigned* gen) {
+    int demand(int layer, int e, unsigned seq, unsigned* gen, bool guessed = false) {
         ++st_.demand;
+        LStats& ls = lst(layer);
+        ++ls.demand;
         int s = where_[(size_t) layer][(size_t) e];
         if (s >= 0) {
             Slot& sp = slots_[(size_t) s];
@@ -153,14 +217,26 @@ public:
                 drop(s);
                 s = -1;
             } else {
-                if (state == kReady) ++st_.ready;
-                else {
+                if (state == kReady) {
+                    ++st_.ready;
+                    if (sp.pf && !sp.used) ++ls.ready_guess;
+                    else ++ls.ready_reuse;
+                } else {
                     ++st_.filling;
+                    if (sp.started.load(std::memory_order_relaxed) > 0) ++ls.fill_r;
+                    else ++ls.fill_q;
+                    if (sp.pf && !sp.used) {
+                        ++ls.lead_n;
+                        ls.lead_us += now_us() - sp.t_fill;
+                    }
                     int64_t z = 0;
                     sp.asked.compare_exchange_strong(z, now_us());
                     promote(s);
                 }
-                if (sp.pf && !sp.used) ++st_.pf_used;
+                if (sp.pf && !sp.used) {
+                    ++st_.pf_used;
+                    ++lst(sp.layer).pf_used;
+                }
                 sp.used = true;
                 sp.pin = seq;
                 sp.touch = ++tick_;
@@ -169,6 +245,8 @@ public:
             }
         }
         ++st_.missed;
+        if (guessed) ++ls.miss_g;
+        else ++ls.miss_u;
         s = take();
         if (s < 0) {
             ++st_.no_slot;
@@ -179,13 +257,24 @@ public:
         sp.pf = false;
         sp.pin = seq;
         sp.asked.store(now_us());
-        fill(s, layer, e, true);
+        fill(s, layer, e, 0);
         *gen = sp.gen;
         return s;
     }
-    /// (layer, e) read ahead (a guess): into a free slot at the back of the queue, unless held or no slot is free
-    void prefetch(int layer, int e) {
-        if (where_[(size_t) layer][(size_t) e] >= 0) return;
+    /// (layer, e) read ahead (a guess): into a free slot behind the demand reads, unless held or no slot is free.  prio 1:
+    /// the next layer's likely picks, 2: farther or less likely guesses (read only when nothing else waits).  A guess
+    /// already being read at a lower priority moves up
+    void prefetch(int layer, int e, int prio = 1) {
+        prio = std::max(1, std::min(2, prio));
+        const int h = where_[(size_t) layer][(size_t) e];
+        if (h >= 0) {
+            Slot& sp = slots_[(size_t) h];
+            if (sp.prio > prio && sp.state.load(std::memory_order_acquire) == kFilling) {
+                requeue(h, prio);
+                sp.prio = prio;
+            }
+            return;
+        }
         const int s = take();
         if (s < 0) return;
         Slot& sp = slots_[(size_t) s];
@@ -193,7 +282,28 @@ public:
         sp.pf = true;
         sp.pin = 0;
         ++st_.pf;
-        fill(s, layer, e, false);
+        ++lst(layer).pf;
+        fill(s, layer, e, prio);
+    }
+    /// (another thread: the expert cache's mover) (layer, e)'s three matrices copied out of the slot that holds it read, to
+    /// dst + at[r] - false when no slot holds it whole (or the slot was taken for another fill meanwhile: what was copied is
+    /// then not trusted).  Lock-free: the slot's generation and state checked before and after the copy
+    bool copy_out(int layer, int e, uint8_t* dst, const size_t at[3]) {
+        if (layer < 0 || (size_t) layer >= where_.size() || e < 0 || (size_t) e >= where_[(size_t) layer].size()) return false;
+        const int s = __atomic_load_n(&where_[(size_t) layer][(size_t) e], __ATOMIC_ACQUIRE);
+        if (s < 0 || s >= cfg_.slots) return false;
+        Slot& sp = slots_[(size_t) s];
+        const unsigned g0 = __atomic_load_n(&sp.gen, __ATOMIC_ACQUIRE);
+        if (sp.state.load(std::memory_order_acquire) != kReady || __atomic_load_n(&sp.layer, __ATOMIC_RELAXED) != layer ||
+            __atomic_load_n(&sp.e, __ATOMIC_RELAXED) != e)
+            return false;
+        const Geo& g = geo_[(size_t) layer];
+        for (int r = 0; r < 3; ++r) std::memcpy(dst + at[r], base(s) + g.reg[r] + g.lead[r], (size_t) g.bytes[r]);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        const bool ok = sp.state.load(std::memory_order_acquire) == kReady && __atomic_load_n(&sp.gen, __ATOMIC_ACQUIRE) == g0 &&
+                        __atomic_load_n(&sp.layer, __ATOMIC_RELAXED) == layer && __atomic_load_n(&sp.e, __ATOMIC_RELAXED) == e;
+        if (ok) ++st_.copied_out;
+        return ok;
     }
     /// (the load's check) (layer, e) read into a slot now, whatever it held, and waited for: the slot (-1: failed)
     int fill_now(int layer, int e) {
@@ -206,30 +316,57 @@ public:
         if (s < 0) return -1;
         slots_[(size_t) s].used = false;
         slots_[(size_t) s].pf = false;
-        fill(s, layer, e, true);
+        fill(s, layer, e, 0);
         while (slots_[(size_t) s].state.load(std::memory_order_acquire) == kFilling) std::this_thread::yield();
         return slots_[(size_t) s].state.load() == kReady && flags_[2 * s] == slots_[(size_t) s].gen &&
                        flags_[2 * s + 1] == slots_[(size_t) s].gen
                    ? s
                    : -1;
     }
-    /// Guesses for layers before `layer` (the token has passed them) whose reads have not started: dropped
-    void cancel_before(int layer) {
-        std::vector<int> gone;
+    /// Guesses for layers before `layer` (the token has passed them, or its request named its picks) whose reads have not
+    /// started: dropped.  started: also those part read - their queued reads dropped, the slot given up once the reads
+    /// under way end (it holds nothing the GPU will ask for: its (layer, expert) forgotten now)
+    void cancel_before(int layer, bool started = false) {
+        std::vector<int> gone, part;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            for (auto it = lo_.begin(); it != lo_.end();) {
-                Slot& sp = slots_[(size_t) it->slot];
-                if (sp.layer < layer && !sp.used && sp.started.load(std::memory_order_relaxed) == 0 && sp.gen == it->gen) {
-                    if (std::find(gone.begin(), gone.end(), it->slot) == gone.end()) gone.push_back(it->slot);
-                    it = lo_.erase(it);
-                } else
+            for (int q = 1; q <= 2; ++q)
+                for (auto it = q_[q].begin(); it != q_[q].end();) {
+                    Slot& sp = slots_[(size_t) it->slot];
+                    if (sp.layer >= 0 && sp.layer < layer && !sp.used && sp.gen == it->gen) {
+                        if (sp.started.load(std::memory_order_relaxed) == 0) {
+                            if (std::find(gone.begin(), gone.end(), it->slot) == gone.end()) gone.push_back(it->slot);
+                            it = q_[q].erase(it);
+                            continue;
+                        }
+                        if (started) {   // (its reads under way finish; the queued ones go, counted down as done-and-bad)
+                            if (std::find(part.begin(), part.end(), it->slot) == part.end()) part.push_back(it->slot);
+                            sp.bad.store(1, std::memory_order_relaxed);
+                            sp.part_bad[it->part].store(1, std::memory_order_relaxed);
+                            sp.part_left[it->part].fetch_sub(1, std::memory_order_acq_rel);
+                            const bool last = sp.left.fetch_sub(1, std::memory_order_acq_rel) == 1;
+                            if (last) sp.state.store(kBadFill, std::memory_order_release);
+                            it = q_[q].erase(it);
+                            continue;
+                        }
+                    }
                     ++it;
+                }
+            for (int s : part) {   // (forgotten under the lock: the readers do not read sp.layer)
+                Slot& sp = slots_[(size_t) s];
+                ++st_.pf_cut;
+                if (sp.layer >= 0) {
+                    ++lst(sp.layer).pf_cut;
+                    where_[(size_t) sp.layer][(size_t) sp.e] = -1;
+                }
+                sp.layer = sp.e = -1;
+                sp.touch = 0;   // (first to go)
             }
         }
         for (int s : gone) {
             Slot& sp = slots_[(size_t) s];
             ++st_.pf_dropped;
+            if (sp.layer >= 0) ++lst(sp.layer).pf_dropped;
             sp.left.store(0);
             sp.part_left[0].store(0);
             sp.part_left[1].store(0);
@@ -249,13 +386,18 @@ private:
         std::atomic<int> part_left[2] = {{0}, {0}};   // chunks of the gate / up, of the down still to come
         std::atomic<int> part_bad[2] = {{0}, {0}};
         std::atomic<int64_t> asked{0};   // (us) when a request asked for it before its fill was done (0: not)
+        int64_t t_fill = 0;              // (us) when its fill was queued (DS4_GL_STATS)
+        std::atomic<int64_t> t_start{0};   // (us) when its first read started
         unsigned pin = 0;          // the last request that uses it (the GPU may read it until a later one is seen)
         uint64_t touch = 0;
         bool pf = false, used = false;
+        int prio = 0;              // its reads' queue: 0 demand, 1 near guesses, 2 far guesses
     };
     struct Job {
         int slot = 0, part = 0;   // part 0: the gate / up, 1: the down
         unsigned gen = 0;
+        int layer = -1;
+        int64_t t_fill = 0;
         int file = 0;
         uint64_t off = 0, len = 0, need = 0;   // file offset (aligned), the read's length, the bytes it must deliver
         uint8_t* dst = nullptr;
@@ -287,15 +429,20 @@ private:
             if (sp.used && (int) (sp.pin - seen_) >= 0) continue;   // (the GPU may still read it)
             if (best < 0 || sp.touch < slots_[(size_t) best].touch) best = i;
         }
-        if (best >= 0) drop(best);
+        if (best >= 0) {
+            Slot& b = slots_[(size_t) best];
+            if (b.pf && !b.used && b.layer >= 0) ++lst(b.layer).pf_wasted;
+            drop(best);
+        }
         return best;
     }
     static int64_t now_us() {
         return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    void fill(int s, int layer, int e, bool front) {
+    void fill(int s, int layer, int e, int prio) {
         Slot& sp = slots_[(size_t) s];
-        if (!front) sp.asked.store(0);
+        if (prio > 0) sp.asked.store(0);
+        sp.prio = prio;
         const Geo& g = geo_[(size_t) layer];
         sp.layer = layer;
         sp.e = e;
@@ -304,6 +451,7 @@ private:
         sp.gen = gen_;
         sp.touch = ++tick_;
         where_[(size_t) layer][(size_t) e] = s;
+        sp.t_fill = now_us();
         std::vector<Job> js;
         for (int r = 0; r < 3; ++r) {
             const uint64_t a0 = g.off[r] + (uint64_t) e * g.stride[r] - g.lead[r];
@@ -312,6 +460,8 @@ private:
                 j.slot = s;
                 j.part = r < 2 ? 0 : 1;
                 j.gen = sp.gen;
+                j.layer = layer;
+                j.t_fill = sp.t_fill;
                 j.file = g.file[r];
                 j.off = a0 + at;
                 j.len = std::min<uint64_t>(cfg_.chunk, g.rlen[r] - at);
@@ -323,6 +473,7 @@ private:
         }
         sp.bad.store(0, std::memory_order_relaxed);
         sp.started.store(0, std::memory_order_relaxed);
+        sp.t_start.store(0, std::memory_order_relaxed);
         int np[2] = {0, 0};
         for (const Job& j : js) ++np[j.part];
         for (int q = 0; q < 2; ++q) {
@@ -333,22 +484,44 @@ private:
         sp.state.store(kFilling, std::memory_order_release);
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (front) hi_.insert(hi_.end(), js.begin(), js.end());
-            else lo_.insert(lo_.end(), js.begin(), js.end());
+            put(prio, js);
         }
         cv_.notify_all();
     }
     // a guess the token now needs: its queued reads move to the demand queue
     void promote(int s) {
+        requeue(s, 0);
+        slots_[(size_t) s].prio = 0;
+    }
+    // a fill's queued reads to queue `to` (ahead of their old one)
+    void requeue(int s, int to) {
         std::lock_guard<std::mutex> lk(mu_);
         const unsigned gen = slots_[(size_t) s].gen;
-        for (auto it = lo_.begin(); it != lo_.end();) {
-            if (it->slot == s && it->gen == gen) {
-                hi_.push_back(*it);
-                it = lo_.erase(it);
-            } else
-                ++it;
+        std::vector<Job> js;
+        for (int q = to + 1; q <= 2; ++q)
+            for (auto it = q_[q].begin(); it != q_[q].end();) {
+                if (it->slot == s && it->gen == gen) {
+                    js.push_back(*it);
+                    it = q_[q].erase(it);
+                } else
+                    ++it;
+            }
+        put(to, js);
+    }
+    // (under mu_) reads into queue q.  DS4_GL_ORDER=1 (the demand queue): a fill's gate / up reads go ahead of the demand
+    // fills' down reads already queued, so every pick's gate / up lands first and the GPU computes them while the downs come
+    void put(int q, const std::vector<Job>& js) {
+        static const bool order = [] { const char* v = std::getenv("DS4_GL_ORDER"); return v != nullptr && std::atoi(v) != 0; }();
+        if (!order || q != 0) {
+            q_[q].insert(q_[q].end(), js.begin(), js.end());
+            return;
         }
+        auto at = q_[0].begin();
+        while (at != q_[0].end() && at->part == 0) ++at;
+        for (const Job& j : js)
+            if (j.part == 0) at = std::next(q_[0].insert(at, j));
+        for (const Job& j : js)
+            if (j.part != 0) q_[0].push_back(j);
     }
     static bool cached(const uint8_t* p, uint64_t n) {
 #if defined(__linux__)
@@ -436,11 +609,24 @@ private:
         }
         if (sp.left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             const bool bad = sp.bad.load(std::memory_order_relaxed) != 0;
+            const int64_t t1 = now_us();
+            if (stats_on_ && j.layer >= 0) {
+                LStats& ls = lst(j.layer);
+                const int64_t t0 = sp.t_start.load(std::memory_order_relaxed);
+                ++ls.qwait_n;
+                ls.qwait_us += t0 - j.t_fill;
+                ++ls.rd_n;
+                ls.rd_us += t1 - t0;
+            }
             sp.state.store(bad ? kBadFill : kReady, std::memory_order_release);
             const int64_t a = sp.asked.exchange(0);
             if (a > 0) {
                 ++st_.waited;
-                st_.wait_us += now_us() - a;
+                st_.wait_us += t1 - a;
+                if (j.layer >= 0) {
+                    ++lst(j.layer).waited;
+                    lst(j.layer).wait_us += t1 - a;
+                }
             }
         }
     }
@@ -498,17 +684,15 @@ private:
             Job j;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return quit_ || !hi_.empty() || !lo_.empty(); });
+                cv_.wait(lk, [&] { return quit_ || !q_[0].empty() || !q_[1].empty() || !q_[2].empty(); });
                 if (quit_) return;
-                if (!hi_.empty()) {
-                    j = hi_.front();
-                    hi_.pop_front();
-                } else {
-                    j = lo_.front();
-                    lo_.pop_front();
-                }
+                const int q = !q_[0].empty() ? 0 : !q_[1].empty() ? 1 : 2;
+                j = q_[q].front();
+                q_[q].pop_front();
                 // (under the lock: cancel_before drops only fills none of whose reads a reader holds)
-                slots_[(size_t) j.slot].started.fetch_add(1, std::memory_order_relaxed);
+                Slot& sp = slots_[(size_t) j.slot];
+                if (sp.started.fetch_add(1, std::memory_order_relaxed) == 0 && sp.gen == j.gen)
+                    sp.t_start.store(now_us(), std::memory_order_relaxed);
             }
             run(j, R);
         }
@@ -526,12 +710,14 @@ private:
     uint64_t tick_ = 0;
     std::mutex mu_;
     std::condition_variable cv_;
-    std::deque<Job> hi_, lo_;
+    std::deque<Job> q_[3];   // the reads: demand, near guesses, far guesses
     bool quit_ = false;
     std::vector<std::thread> th_, kth_;
     std::unique_ptr<Reader[]> rd_;
     std::atomic<bool> kquit_{false};
     Stats st_;
+    LStats lst_[kStatL];
+    bool stats_on_ = true;
 };
 
 }  // namespace strata::ds4

@@ -546,13 +546,31 @@ __device__ __forceinline__ int route_fallback_pick(const int* pick, int r, int n
     }
     return ix < n ? ix : 0;
 }
+// DS4_CAR_LAMBDA (lossy, opt-in): cache-aware routing (Cache-Prior, arXiv 2412.00099).  The first car.j picks are the
+// router's own; before pick car.j every expert this device holds (vram[i] != 0) gets lam * (top - mean) added to its
+// selection score (top: the first pick's score, mean: the n scores' mean before any pick).  The mixing weights stay the
+// unbiased scores' (sc) over whatever was picked.  car.vram null or lam 0: the router's picks bit for bit
+__device__ __forceinline__ bool car_on(const Car& c) { return c.vram != nullptr && c.lam > 0.0f; }
+__device__ float car_mean(const Car& c, const float* bs, int n) {
+    float v = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) v += bs[i];
+    return block_sum(v) / (float) n;
+}
+__device__ void car_boost(const Car& c, float* bs, int n, float top, float mean) {
+    const float add = c.lam * (top - mean);
+    if (isfinite(add) && add > 0.0f)
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (c.vram[i] != 0ull && bs[i] > -FLT_MAX) bs[i] += add;
+    __syncthreads();
+}
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
-                                                    const float* __restrict__ bias_vl, const VlBits vl) {
+                                                    const float* __restrict__ bias_vl, const VlBits vl, const Car car) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
     __shared__ int pick[16];
+    __shared__ float car_top;
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl.w[t >> 5] >> (t & 31)) & 1u)) bias = bias_vl;
@@ -563,8 +581,10 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
+    const float cmean = car_on(car) ? car_mean(car, bs, n) : 0.0f;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
+        if (r == car.j && r > 0 && car_on(car)) car_boost(car, bs, n, car_top, cmean);
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -582,6 +602,7 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
             if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (a non-finite gate input: see route_fallback_pick)
+            if (r == 0) car_top = b;
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -1629,12 +1650,13 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl, const Car car) {
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
     __shared__ int pick[16];
     __shared__ int on_cpu;
+    __shared__ float car_top;
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
@@ -1645,8 +1667,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
+    const float cmean = car_on(car) ? car_mean(car, bs, n) : 0.0f;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
+        if (r == car.j && r > 0 && car_on(car)) car_boost(car, bs, n, car_top, cmean);
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -1664,6 +1688,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
             if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (a non-finite gate input: see route_fallback_pick)
+            if (r == 0) car_top = b;
             pick[r] = ix;
             bs[ix] = -FLT_MAX;
         }
@@ -1696,10 +1721,11 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
-                                                          int off) {
+                                                          int off, const Car car) {
     __shared__ float bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
+    __shared__ float car_top;
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -1708,8 +1734,10 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
         bs[i] = sqrtf(sp) + bias[i];
     }
     __syncthreads();
+    const float cmean = car_on(car) ? car_mean(car, bs, n) : 0.0f;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < m; ++r) {
+        if (r == car.j && r > 0 && car_on(car)) car_boost(car, bs, n, car_top, cmean);
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -1727,6 +1755,7 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
             req->ahead[t][off + r] = ix < n ? ix : -1;
+            if (r == 0) car_top = b;
             if (ix < n) bs[ix] = -FLT_MAX;
         }
         __syncthreads();
@@ -2203,6 +2232,7 @@ struct GateSegK {
     const float* W;
     const uint16_t* Wb;   // (DS4_ROUTER_BF16: the BF16 values instead of W; gemv_bf16w_kernel's row)
     const float* bias;
+    Car car;              // (DS4_CAR_LAMBDA: the segment's layer's VRAM table; lam 0 off)
     float* y;
     int n, nb, m, off;
 };
@@ -2221,7 +2251,8 @@ struct GateRouteK {
 };
 // route_publish_kernel's selection for token t, any blockDim (a multiple of 32, <= 1024); logits read past the L1
 __device__ void gate_pick(const float* logits, const float* __restrict__ bias, int n, int k, float* sc, float* bs,
-                          float* bv, int* bi, int* pick, bool keep_sc, bool fallback) {
+                          float* bv, int* bi, int* pick, bool keep_sc, bool fallback, const Car car) {
+    __shared__ float car_top;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float l = *(const volatile float*) (logits + i);
         const float sp = l > 20.0f ? l : log1pf(expf(l));
@@ -2230,8 +2261,10 @@ __device__ void gate_pick(const float* logits, const float* __restrict__ bias, i
         bs[i] = sq + bias[i];
     }
     __syncthreads();
+    const float cmean = car_on(car) ? car_mean(car, bs, n) : 0.0f;
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     for (int r = 0; r < k; ++r) {
+        if (r == car.j && r > 0 && car_on(car)) car_boost(car, bs, n, car_top, cmean);
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -2248,6 +2281,7 @@ __device__ void gate_pick(const float* logits, const float* __restrict__ bias, i
             int ix = 0x7fffffff;
             for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
                 if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (r == 0) car_top = b;
             if (fallback) {
                 if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (route_publish_kernel's)
                 pick[r] = ix;
@@ -2310,7 +2344,7 @@ __global__ void __launch_bounds__(kThreads) gate_route_kernel(const float* __res
     const float* lg = S.y + (size_t) t * p.ldy;
     if (sg == 0) {   // route_publish_kernel
         const float* bias = p.bias_vl != nullptr && ((p.vl >> t) & 1u) ? p.bias_vl : S.bias;
-        gate_pick(lg, bias, S.n, p.kp, sc, bs, bv, bi, pick, true, true);
+        gate_pick(lg, bias, S.n, p.kp, sc, bs, bv, bi, pick, true, true, S.car);
         if (threadIdx.x == 0) {
             float s = 0.0f;
             for (int r = 0; r < p.kp; ++r) s += sc[pick[r]];
@@ -2332,7 +2366,7 @@ __global__ void __launch_bounds__(kThreads) gate_route_kernel(const float* __res
         if (p.req != nullptr && on_cpu)
             for (int i = threadIdx.x; i < p.k; i += blockDim.x) p.req->x[t][i] = x[(size_t) t * p.k + i];
     } else {   // route_ahead_kernel
-        gate_pick(lg, S.bias, S.n, S.m, sc, bs, bv, bi, pick, false, false);
+        gate_pick(lg, S.bias, S.n, S.m, sc, bs, bv, bi, pick, false, false, S.car);
         if (threadIdx.x == 0)
             for (int r = 0; r < S.m; ++r) p.req->ahead[t][S.off + r] = pick[r];
     }
@@ -2355,6 +2389,21 @@ __global__ void __launch_bounds__(kThreads) gate_route_kernel(const float* __res
 int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 }  // namespace
+
+Car car_of(const unsigned long long* vram) {
+    static const float lam = std::getenv("DS4_CAR_LAMBDA") ? (float) std::atof(std::getenv("DS4_CAR_LAMBDA")) : 0.0f;
+    static const int j = std::getenv("DS4_CAR_J") ? std::max(1, std::min(kPicks, std::atoi(std::getenv("DS4_CAR_J")))) : 2;
+    static const bool said = [] {
+        if (lam > 0.0f) std::fprintf(stderr, "ds4: cache-aware routing (DS4_CAR_LAMBDA=%g, DS4_CAR_J=%d): picks after the router's first %d lean to the VRAM's experts (lossy)\n", lam, j, j);
+        return true;
+    }();
+    (void) said;
+    Car c;
+    c.vram = lam > 0.0f ? vram : nullptr;
+    c.lam = lam;
+    c.j = j;
+    return c;
+}
 
 namespace {
 
@@ -2462,17 +2511,18 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     }
 #endif
     strata_ds4_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
+                                           vl != 0 ? bias_vl : nullptr, vl, car_of(vram));
     if (req != nullptr) strata_ds4_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
 }
-void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s,
+                 const unsigned long long* vram) {
 #if defined(STRATA_METAL)
     // no prefetch schedule on the Mac path yet: the router publishes no requests, so there is nothing to look ahead for
     (void) logits; (void) bias; (void) n; (void) m; (void) T; (void) req; (void) off; (void) s;
     return;
 #endif
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
-        strata_ds4_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
+        strata_ds4_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off, car_of(vram));
 }
 bool router_nonfinite_take(cudaStream_t s) {
 #if defined(STRATA_METAL)
@@ -2557,6 +2607,7 @@ bool gate_route(const float* x, int k, int T, const GateSeg* seg, int nseg, int 
         p.seg[i].nb = cdiv(sgi.n, kThreads / 32);
         p.seg[i].m = i > 0 ? sgi.m : kp;
         p.seg[i].off = i > 0 ? sgi.off : 0;
+        p.seg[i].car = car_of(i > 0 ? sgi.vram : vram);
         nb += p.seg[i].nb;
     }
     for (int i = nseg; i < 3; ++i) p.seg[i] = p.seg[0];   // (unused)
@@ -2766,14 +2817,14 @@ void gemv_bf16w(const uint16_t* W, const float* x, int n, int k, int T, float* y
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
-           cudaStream_t s, const float* bias_vl, const VlBits* vl) {
+           cudaStream_t s, const float* bias_vl, const VlBits* vl, const unsigned long long* vram) {
     static const VlBits none = {};
 #if defined(STRATA_METAL)
     // route_kernel on the Metal dispatch; the launch below is the fallback
     if (strata::dsv41::metal_host::route(logits, bias, n, k, T, route_scale, idx, w, bias_vl, vl)) return;
 #endif
     strata_ds4_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
-                                   vl != nullptr ? *vl : none);
+                                   vl != nullptr ? *vl : none, car_of(vram));
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {

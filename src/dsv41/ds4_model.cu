@@ -1385,6 +1385,7 @@ struct Model::Impl {
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        bool skip = false;   // (DS4_GL_SWAP_SLOT=2: no lane slot held `in` any more - nothing moved, the switch leaves it)
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1463,6 +1464,7 @@ struct Model::Impl {
     uint8_t* gl_slab = nullptr;                 // host-mapped: the slots
     int gl_pf_n = 16;                           // DS4_GL_PF_N: the next layer's guesses read ahead, by rank (the best n)
     int gl_pf_n2 = 8;                           // DS4_GL_PF_N2: the layer after's (DS4_AHEAD=2)
+    int gl_pf_mid = 16;                         // DS4_GL_PF_MID: of the next layer's, the best n read before the rest
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
@@ -5660,7 +5662,9 @@ struct Model::Impl {
             {   // the profile as the starting heat: its counts scaled to ~512 hits a layer
                 double sum = 0;
                 for (int e = 0; e < l.n_exp; ++e) sum += p[e];
-                const double sc = sum > 0 ? 512.0 / sum : 0.0;
+                // (DS4_CACHE_PRIOR: that scale; smaller, the profile's ranks give way to this conversation's use sooner)
+                static const double prior = std::max(0.0, (double) env_f("DS4_CACHE_PRIOR", 512.0f));
+                const double sc = sum > 0 ? prior / sum : 0.0;
                 for (int e = 0; e < l.n_exp; ++e) l.heat[(size_t) e] = (float) (p[e] * sc);
             }
             const int n_host = l.n_exp - l.n_vram;
@@ -6685,6 +6689,7 @@ struct Model::Impl {
         }
         gl_pf_n = std::max(0, (int) env_f("DS4_GL_PF_N", 16.0f));
         gl_pf_n2 = std::max(0, (int) env_f("DS4_GL_PF_N2", 8.0f));
+        gl_pf_mid = std::max(0, (int) env_f("DS4_GL_PF_MID", 16.0f));
         Dev& d = devs[0];
         cudaSetDevice(d.id);
         if (!hmap(gl_slab, (size_t) c.slots * stride, err) || !hmap(gl_pull, (size_t) kRing, err) ||
@@ -6717,6 +6722,21 @@ struct Model::Impl {
         auto lane = std::make_unique<GpuLane>();
         lane->init(c, geo, files, gl_slab, stride, gl_flags);
         gl = std::move(lane);
+        if (env_tri("DS4_GL_STATS") > 0) {   // (the per-layer table at exit, or when the lane goes)
+            GpuLane::reporter().store(gl.get());
+            std::atexit([] { if (GpuLane* r = GpuLane::reporter().exchange(nullptr)) r->report(); });
+        }
+        if (const char* rp = std::getenv("DS4_RESIDENT_DUMP")) {   // (analysis) each layer's VRAM experts at load: n_exp bytes a layer, 1 = VRAM
+            if (std::FILE* f = std::fopen(rp, "wb")) {
+                for (const Layer& l : L) {
+                    if (l.mtp) continue;
+                    std::vector<uint8_t> v((size_t) l.n_exp, 0);
+                    for (int e = 0; e < l.n_exp; ++e) v[(size_t) e] = l.slot[(size_t) e] >= 0;
+                    std::fwrite(v.data(), 1, v.size(), f);
+                }
+                std::fclose(f);
+            }
+        }
         if (env_tri("DS4_GL_CHECK") > 0) gl_check();
         std::fprintf(stderr, "ds4: GPU lane: %d layers' CPU-lane picks computed by the GPU from %d pinned slots of %.1f MB "
                              "(%.0f MB), %d reading threads (CPUs %s), %llu KB reads, misses %s, kicks after %.1f ms\n",
@@ -6854,7 +6874,7 @@ struct Model::Impl {
     }
     // (serve_lane, a decode request on a GPU-lane layer) its CPU-lane picks that a slot takes: out of `picks`, their slots in
     // the request's pull, which is published either way (the GPU's fetch waits for it)
-    void gl_take(const Layer& l, std::vector<std::pair<int, int>>& picks, unsigned seq) {
+    void gl_take(const Layer& l, std::vector<std::pair<int, int>>& picks, unsigned seq, const uint8_t* fl = nullptr) {
         pcie::GlPull* P = gl_pull + seq % kRing;
         for (int i = 0; i < pcie::kGlPicks; ++i) {
             P->slot[i] = -1;
@@ -6865,7 +6885,7 @@ struct Model::Impl {
         for (const auto& pk_ : picks) {
             const int e = pk_.first, i = pk_.second;
             unsigned gen = 0;
-            const int s = i < l.k_exp && file_read(l, e) ? gl->demand(l.il, e, seq, &gen) : -1;
+            const int s = i < l.k_exp && file_read(l, e) ? gl->demand(l.il, e, seq, &gen, fl != nullptr && (fl[e] & 8) != 0) : -1;
             if (s < 0) {
                 keep.push_back(pk_);
                 continue;
@@ -8976,8 +8996,20 @@ struct Model::Impl {
     void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
-        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
-                                                                                          // this swap's switch)
+        // (DS4_GL_SWAP_SLOT, the GPU lane: from the pinned slot that holds it when one does - the lane just read it - not
+        // the files again)
+        // DS4_GL_SWAP_SLOT=2: from a slot only - a move whose expert no slot holds any more is left out (no file read
+        // competing with the lane's)
+        static const int from_slot = std::max(0, env_tri("DS4_GL_SWAP_SLOT"));
+        size_t at[3] = {l.lay.trellis[0], l.lay.trellis[1], l.lay.trellis[2]};
+        const bool lane_l = !copy_mode && from_slot > 0 && gl && l.il < (int) gl_ok.size() && gl_ok[(size_t) l.il];
+        const bool got_slot = lane_l && gl->copy_out(l.il, sw.in, sw_a, at);
+        if (lane_l && !got_slot && from_slot >= 2) {
+            sw.skip = true;
+            return;
+        }
+        bool ok = got_slot || (copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a));   // (a copy holds its slot till
+                                                                                                        // this swap's switch)
         for (int m = 0; m < l.nm && ok; ++m) {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
@@ -9539,6 +9571,13 @@ struct Model::Impl {
         }
         for (const Swap& sw : ready) {
             Layer& l = L[(size_t) sw.layer];
+            if (sw.skip) {   // (nothing moved)
+                l.swap_pending = false;
+                l.sw_in = -1;
+                --sw_inflight;
+                ++st.swaps_skipped;
+                continue;
+            }
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
@@ -9709,14 +9748,20 @@ struct Model::Impl {
                     if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
-                    if ((fl[e] & 8) || !file_read(n, e)) continue;
+                    if (!file_read(n, e)) continue;
+                    if (fl[e] & 8) {   // (asked for already - by the guess two layers before: now at the near guesses' priority)
+                        if (a == 1 && gl && T == 1 && gl_ok[(size_t) j] && i < gl_pf_n && i < gl_pf_mid) gl->prefetch(j, e, 1);
+                        continue;
+                    }
                     fl[e] |= 8;
                     // (DISK_SKIP_AUTO while skipping: not in RAM when asked for - the lookahead's read would hide it)
                     if (disk_skip_auto && j < g.nl && sk_auto.on.load(std::memory_order_relaxed) && !in_ram(n, e))
                         fl[e] |= 16;
                     if (store) store->prefetch(j, e);
                     else if (gl && T == 1 && gl_ok[(size_t) j]) {
-                        if (i < (a == 1 ? gl_pf_n : gl_pf_n2)) gl->prefetch(j, e);
+                        // (the next layer's best DS4_GL_PF_MID guesses at the near guesses' priority; the rest and the
+                        // layer after's behind them)
+                        if (i < (a == 1 ? gl_pf_n : gl_pf_n2)) gl->prefetch(j, e, a == 1 && i < gl_pf_mid ? 1 : 2);
                     }
                     else
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
@@ -9806,6 +9851,15 @@ struct Model::Impl {
                         }
                     }
                 }
+                if (trace_f != nullptr && !l.mtp && T == 1) {   // DS4_TRACE_RES=file (analysis): a decode request's k picks, 1 each held in VRAM now
+                    static std::FILE* rf = std::getenv("DS4_TRACE_RES") ? std::fopen(std::getenv("DS4_TRACE_RES"), "wb") : nullptr;
+                    if (rf != nullptr) {
+                        uint8_t v[kPicks + 1] = {(uint8_t) li};
+                        for (int i = 0; i < l.k_exp && i < kPicks; ++i)
+                            v[i + 1] = r.ids[0][i] >= 0 && r.ids[0][i] < l.n_exp && l.slot[(size_t) r.ids[0][i]] >= 0;
+                        std::fwrite(v, 1, (size_t) l.k_exp + 1, rf);
+                    }
+                }
                 const bool dsk_rule = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 // (DISK_SKIP_AUTO: skipping now; its counts only then - the routed experts computed either way, of them
                 //  on the CPU lane and not in RAM, of them on the CPU lane)
@@ -9881,7 +9935,13 @@ struct Model::Impl {
                 if (gl) {
                     gl->seen(next);
                     gl->cancel_before(li);
-                    if (T == 1 && gl_ok[(size_t) li]) gl_take(l, picks, next);
+                    if (T == 1 && gl_ok[(size_t) li]) {
+                        gl_take(l, picks, next, fl);
+                        // DS4_GL_CANCEL: this layer's picks are known - its guesses not asked for are wrong: 1 those not
+                        // started dropped, 2 also those part read cut short (their bandwidth for the next layers' reads)
+                        static const int gl_cancel = (int) env_f("DS4_GL_CANCEL", 0.0f);
+                        if (gl_cancel > 0) gl->cancel_before(li + 1, gl_cancel >= 2);
+                    }
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
                 // the PCIe lane (a decoded token on a layer that streams): the picks it takes leave the CPU lane's, their
@@ -12024,7 +12084,7 @@ struct Model::Impl {
             VlBits vb;
             const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
             route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
-                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
+                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr, l.vram_tab);
         }
         const int n_vs = L0.pv_n + (int) L0.host_list.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
@@ -14521,6 +14581,7 @@ struct Model::Impl {
                     gs[ns].n = nx->n_exp;
                     gs[ns].m = m;
                     gs[ns].off = (a - 1) * kAhead1;
+                    gs[ns].vram = nx->vram_tab;
                     ++ns;
                     nf[a - 1] = m;
                 }
@@ -14538,7 +14599,7 @@ struct Model::Impl {
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                 gate_gemv(*nx, d.x, T, gl, s);   // (normed with the next layer's FFN
                                                                          // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s, nx->vram_tab);
                 na[a - 1] = m;
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
@@ -14690,7 +14751,7 @@ struct Model::Impl {
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
-              vb.w[0] != 0 ? &vb : nullptr);
+              vb.w[0] != 0 ? &vb : nullptr, l.vram_tab);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_x, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, s));

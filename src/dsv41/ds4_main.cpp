@@ -2827,6 +2827,9 @@ int main(int argc, char** argv) {
                      (double) (s.gl_wait_us - s0.gl_wait_us) / 1e3 / nt, (long long) (s.gl_kicks - s0.gl_kicks),
                      (long long) (s.gl_slow - s0.gl_slow), (double) (s.gl_slow_us - s0.gl_slow_us) / 1e3);
     }
+    if (s.swaps_skipped > s0.swaps_skipped)   // DS4_GL_SWAP_SLOT=2
+        std::fprintf(stderr, "expert cache: %lld moves left out (no lane slot held the expert any more)\n",
+                     (long long) (s.swaps_skipped - s0.swaps_skipped));
     if (s.skipped > s0.skipped)   // STRATA_DS4_DISK_SKIP_W
         std::fprintf(stderr, "decode left out %.1f experts a token not in RAM (%.1f%% of the routed)\n",
                      (double) (s.skipped - s0.skipped) / nt,
