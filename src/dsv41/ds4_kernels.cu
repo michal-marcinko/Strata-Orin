@@ -2045,6 +2045,134 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
     if (any) acc[(size_t) t * dim + e] = a;
 }
 
+#if !defined(STRATA_METAL)
+// ---------------------------------------------------------------- DS4_FUSE: the decode layer's fused launches
+// hc_fused_kernel: [hc_post] + hc_mix + hc_split + hc_pre_norm of one token (blockIdx.y), hc == 4 streams, for a block's
+// kHcCols columns e of every stream (4 x 64 values, one a thread).  The lagged pre-mix (ds4_model.cu's header) is what
+// makes this one launch: the norm reads the previous mix's pre (norm_mix), not the split this launch computes.
+//   kPost: h[s][e] = post_in[s] y[e] + sum_j comb_in[j][s] res[j][e] (hc_post_kernel's products in its order), written
+//          to h_out; else h = res as it is
+//   the block's partial sums to part[t][block][..]: the n_mix dots of h with fn[m], sum h^2, and sum x^2 of the block's
+//          x[e] = sum_s norm_mix[s] h[s][e] (hc_pre_norm_kernel's sum in its order; x written unnormalized)
+//   the token's last block (an atomic count, reset by it) sums the partials in block order (a fixed order: the same bits
+//          run to run), writes mixes (hc_mix's value up to the dots' summation order), runs the split on warp 0
+//          (hc_split_body, as hc_mix_split_kernel's last block), copies pre to pre_copy (the layer's closing
+//          d.pre = f_pre copy, when given) and normalizes x in place (hc_pre_norm's x * inv * w)
+constexpr int kHcCols = 64;   // a block's columns of each of the 4 streams: 256 values, a thread each
+constexpr int kHcQ = 32;      // partial sums a block leaves: n_mix dots, sum h^2, 2 halves of sum x^2 (n_mix <= 29)
+template <bool kPost>
+__global__ void __launch_bounds__(kThreads) hc_fused_kernel(const float* __restrict__ y, const float* __restrict__ post_in,
+                                                            const float* __restrict__ comb_in, const float* __restrict__ res,
+                                                            float* __restrict__ h_out, const float* __restrict__ fn, int dim,
+                                                            int n_mix, float eps, float* mixes, float* part, unsigned* cnt,
+                                                            const float* __restrict__ scale, const float* __restrict__ base,
+                                                            int iters, float hc_eps, float* pre, float* post, float* comb,
+                                                            float* pre_copy, const float* __restrict__ norm_mix,
+                                                            const float* __restrict__ norm_w, float norm_eps, float* x) {
+    constexpr int kHc = 4, kRowsW = 4;   // (n_mix <= 32 = 8 warps x kRowsW rows)
+    __shared__ __align__(16) float hs[kHc * kHcCols];
+    __shared__ float tot[kHcQ];
+    __shared__ float smx[32];
+    __shared__ unsigned last;
+    const int t = blockIdx.y, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int e0 = blockIdx.x * kHcCols;
+    const size_t hcdim = (size_t) kHc * dim;
+    // the block's weights first (6 16-byte loads a thread in flight across the h stage): float4 i of the block's 256
+    // values is stream i / 16, columns e0 + (i % 16) * 4 .. + 3
+    float4 wv[kRowsW][2];
+#pragma unroll
+    for (int r = 0; r < kRowsW; ++r) {
+        const int m = w + 8 * r;
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const int i = lane + 32 * q;
+            wv[r][q] = m < n_mix ? *(const float4*) (fn + (size_t) m * hcdim + (size_t) (i >> 4) * dim + e0 + (i & 15) * 4)
+                                 : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    {
+        const int s = tid / kHcCols, e = e0 + tid % kHcCols;
+        const float* r = res + (size_t) t * hcdim;
+        float v;
+        if (kPost) {
+            float a = post_in[(size_t) t * 8 + s] * y[(size_t) t * dim + e];
+            for (int j = 0; j < kHc; ++j) a += comb_in[(size_t) t * 64 + j * kHc + s] * r[(size_t) j * dim + e];
+            h_out[(size_t) t * hcdim + (size_t) s * dim + e] = a;
+            v = a;
+        } else {
+            v = r[(size_t) s * dim + e];
+        }
+        hs[tid] = v;   // (tid = s * kHcCols + column)
+    }
+    __syncthreads();
+    float* pb = part + ((size_t) t * gridDim.x + blockIdx.x) * kHcQ;
+#pragma unroll
+    for (int r = 0; r < kRowsW; ++r) {
+        const int m = w + 8 * r;
+        if (m < n_mix) {   // (warp-uniform; no break: wv stays in registers)
+            float acc = 0.0f;
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                const float4 hv = *(const float4*) (hs + 4 * (lane + 32 * q));
+                acc += hv.x * wv[r][q].x + hv.y * wv[r][q].y + hv.z * wv[r][q].z + hv.w * wv[r][q].w;
+            }
+            acc = warp_sum(acc);
+            if (lane == 0) pb[m] = acc;
+        }
+    }
+    if (w == 7) {   // sum h^2 of the block (warp 7 has the fewest rows: n_mix 24 gives it m = 7, 15, 23)
+        float ss = 0.0f;
+#pragma unroll
+        for (int q = 0; q < 2; ++q) {
+            const float4 hv = *(const float4*) (hs + 4 * (lane + 32 * q));
+            ss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
+        }
+        ss = warp_sum(ss);
+        if (lane == 0) pb[n_mix] = ss;
+    }
+    if (tid < kHcCols) {   // warps 0 and 1: the block's x columns, unnormalized
+        float a = 0.0f;
+        for (int s = 0; s < kHc; ++s) a += norm_mix[(size_t) t * 8 + s] * hs[s * kHcCols + tid];
+        x[(size_t) t * dim + e0 + tid] = a;
+        const float sx = warp_sum(a * a);
+        if (lane == 0) pb[n_mix + 1 + w] = sx;
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) last = atomicAdd(cnt + t, 1u) == gridDim.x - 1 ? 1u : 0u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    const int nq = n_mix + 3, nb = (int) gridDim.x;
+    const float* pt = part + (size_t) t * nb * kHcQ;
+    for (int q = w; q < nq; q += 8) {   // partials read past the L1 (other blocks wrote them)
+        float a = 0.0f;
+        for (int b = lane; b < nb; b += 32) a += *(const volatile float*) (pt + (size_t) b * kHcQ + q);
+        a = warp_sum(a);
+        if (lane == 0) tot[q] = a;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        float mv = 0.0f;
+        if (tid < n_mix) {
+            mv = tot[tid] * rsqrtf(tot[n_mix] / (float) hcdim + eps);
+            mixes[(size_t) t * 32 + tid] = mv;
+        }
+        smx[tid] = mv;
+        __syncwarp();
+        hc_split_body(smx, t, lane, scale, base, kHc, iters, hc_eps, pre, post, comb);
+        if (pre_copy != nullptr && lane < kHc) pre_copy[(size_t) t * 8 + lane] = pre[(size_t) t * 8 + lane];
+    }
+    const float inv = rsqrtf((tot[n_mix + 1] + tot[n_mix + 2]) / (float) dim + norm_eps);
+    float* xt = x + (size_t) t * dim;
+    for (int e = tid; e < dim; e += kThreads) {
+        const float v = *(const volatile float*) (xt + e);
+        xt[e] = norm_w != nullptr ? v * inv * norm_w[e] : v;
+    }
+    if (tid == 0) cnt[t] = 0u;
+}
+#endif
+
 int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 }  // namespace
@@ -2195,6 +2323,31 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) {
     return;
 #endif
     strata_ds4_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq);
+}
+
+bool hc_fused(const float* y, const float* post_in, const float* comb_in, const float* h, float* h_out, const float* fn,
+              int dim, int hc, int n_mix, int T, float eps, float* mixes, float* part, unsigned* cnt,
+              const float* scale, const float* base, int iters, float hc_eps, float* pre, float* post, float* comb,
+              float* pre_copy, const float* norm_mix, const float* norm_w, float* x, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    (void) y; (void) post_in; (void) comb_in; (void) h; (void) h_out; (void) fn; (void) dim; (void) hc; (void) n_mix;
+    (void) T; (void) eps; (void) mixes; (void) part; (void) cnt; (void) scale; (void) base; (void) iters; (void) hc_eps;
+    (void) pre; (void) post; (void) comb; (void) pre_copy; (void) norm_mix; (void) norm_w; (void) x; (void) s;
+    return false;
+#else
+    if (hc != 4 || dim <= 0 || dim % kHcCols != 0 || n_mix < 1 || n_mix + 3 > kHcQ || T < 1 || T > kWin ||
+        part == nullptr || cnt == nullptr || (y != nullptr && (post_in == nullptr || comb_in == nullptr || h_out == nullptr)) ||
+        ((size_t) fn & 15u) != 0)
+        return false;
+    const dim3 grid((unsigned) (dim / kHcCols), (unsigned) T);
+    if (y != nullptr)
+        strata_ds4_launch(hc_fused_kernel<true>, grid, kThreads, 0, s, y, post_in, comb_in, h, h_out, fn, dim, n_mix, eps,
+                          mixes, part, cnt, scale, base, iters, hc_eps, pre, post, comb, pre_copy, norm_mix, norm_w, eps, x);
+    else
+        strata_ds4_launch(hc_fused_kernel<false>, grid, kThreads, 0, s, y, post_in, comb_in, h, h_out, fn, dim, n_mix, eps,
+                          mixes, part, cnt, scale, base, iters, hc_eps, pre, post, comb, pre_copy, norm_mix, norm_w, eps, x);
+    return true;
+#endif
 }
 
 // the RAM store's experts for the device (a decode token, window of one): a pick the VRAM table left at 0 whose expert the store holds

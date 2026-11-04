@@ -81,6 +81,17 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// DS4_FUSE (the decode layer): [hc_post(y, h, post_in, comb_in) -> h_out, when y is given] + hc_mix_split of the streams
+/// + hc_pre_norm of them with norm_mix (the lagged pre) and norm_w -> x, one launch of dim / 64 blocks a token.  pre_copy
+/// (null: none) gets pre's hc values too (the layer's closing d.pre = f_pre copy).  eps is the mix's and the norm's.  The
+/// h_out, x and split values are the separate launches' up to the summation order of the mix dots and of the norm's sum
+/// of squares (h_out bit for bit).  part: hc_fused_part(dim) floats of scratch, cnt: kWin zeroed counters (left zero).
+/// False, nothing launched, where it does not apply (hc != 4, dim % 64, n_mix > 29, T > kWin, Metal).
+bool hc_fused(const float* y, const float* post_in, const float* comb_in, const float* h, float* h_out, const float* fn,
+              int dim, int hc, int n_mix, int T, float eps, float* mixes, float* part, unsigned* cnt,
+              const float* scale, const float* base, int iters, float hc_eps, float* pre, float* post, float* comb,
+              float* pre_copy, const float* norm_mix, const float* norm_w, float* x, cudaStream_t s);
+inline size_t hc_fused_part(int dim) { return (size_t) kWin * (size_t) (dim / 64 + 1) * 32; }
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);

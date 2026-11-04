@@ -108,6 +108,13 @@ int env_tri(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
 }
+// the decode layer's fused launches (A/B switches, off by default): DS4_FUSE=1 turns every one on, DS4_FUSE_<name>=1 / 0
+// one on / off whatever DS4_FUSE says.  DS4_FUSE_HC: hc_fused (hc_post + mix + split + pre-norm, two launches a layer
+// instead of six)
+bool fuse_on(const char* name) {
+    const int own = env_tri(name);
+    return own >= 0 ? own == 1 : env_tri("DS4_FUSE") == 1;
+}
 
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -656,6 +663,9 @@ struct Dev {
     unsigned ar_seq = 0;
     unsigned* xcnt = nullptr;
     unsigned* hccnt = nullptr;   // [kWin] hc_mix_split's per-token block counters (zeroed at allocation, left zero)
+    // DS4_FUSE: hc_fused's partial sums and counters (zeroed at allocation, left zero)
+    float* hfpart = nullptr;
+    unsigned* hfcnt = nullptr;
     // the head group's members (the last layer's group): each its columns (split128 of V) of the head and the norms;
     // logits_part: a member's share of the logits (the lead's: where the others' land before they join its rows)
     x3::Mat head;
@@ -3245,7 +3255,8 @@ struct Model::Impl {
             }
             if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
-            if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hccnt, kWin, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
+            if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hccnt, kWin, err) || !dalloc(d, d.hfpart, hc_fused_part(D), err) ||
+                !dalloc(d, d.hfcnt, kWin, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
                 !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
                 !dalloc(d, d.n_groups, 4, err))
                 return false;
@@ -14332,6 +14343,12 @@ struct Model::Impl {
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
         // attention
+        // DS4_FUSE_HC: the mix, its split and the pre-norm (of the lagged pre) in one launch
+        static const bool fuse_hc = fuse_on("DS4_FUSE_HC");
+        const bool fused_a = fuse_hc && hc_fused(nullptr, nullptr, nullptr, d.h, nullptr, l.hca_fn, D, H, (2 + H) * H, T,
+                                                 g.eps, d.mix, d.hfpart, d.hfcnt, l.hca_scale, l.hca_base, g.sinkhorn,
+                                                 g.hc_eps, d.a_pre, d.a_post, d.a_comb, nullptr, d.pre, l.attn_norm, d.x, s);
+        if (!fused_a) {
 #if defined(STRATA_METAL)
         hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, l.hca_scale, l.hca_base, H,
                      g.sinkhorn, g.hc_eps, d.a_pre, d.a_post, d.a_comb, s);
@@ -14339,11 +14356,12 @@ struct Model::Impl {
         hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
                      d.a_pre, d.a_post, d.a_comb, s);
 #endif
+        }
         dump_sub(d, "a_mix", l.il, p0, T, d.mix, (size_t) T * 32 * 4);
         dump_sub(d, "a_pre", l.il, p0, T, d.a_pre, (size_t) T * 8 * 4);
         dump_sub(d, "a_post", l.il, p0, T, d.a_post, (size_t) T * 8 * 4);
         dump_sub(d, "a_comb", l.il, p0, T, d.a_comb, (size_t) T * 64 * 4);
-        hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        if (!fused_a) hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         dump_sub(d, "pre_in", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "attn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
         {
@@ -14399,12 +14417,19 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
-        hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
+        // DS4_FUSE_HC: this hc_post with the MoE's mix, split and pre-norm in one launch; its split's pre also goes to
+        // d.pre (the layer's closing d.pre = f_pre copy, left out below; nothing in the layer reads d.pre after the
+        // attention's norm).  (DS4_PROF: the FFN's mix then counts in stage 0-1, the attention's)
+        const bool fused_f = fuse_hc && hc_fused(d.ao, d.a_post, d.a_comb, d.h, d.h2, l.hcf_fn, D, H, (2 + H) * H, T, g.eps,
+                                                 d.mix, d.hfpart, d.hfcnt, l.hcf_scale, l.hcf_base, g.sinkhorn, g.hc_eps,
+                                                 d.f_pre, d.f_post, d.f_comb, d.pre, d.a_pre, l.ffn_norm, d.x, s);
+        if (!fused_f) hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         dump_sub(d, "h_attn", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         prof_mark(d, 1);
         // the MoE
+        if (!fused_f) {
 #if defined(STRATA_METAL)
         hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, l.hcf_scale, l.hcf_base, H,
                      g.sinkhorn, g.hc_eps, d.f_pre, d.f_post, d.f_comb, s);
@@ -14413,6 +14438,7 @@ struct Model::Impl {
                      d.f_pre, d.f_post, d.f_comb, s);
 #endif
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        }
         dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
         dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
@@ -14568,7 +14594,7 @@ struct Model::Impl {
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
-            CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+            if (!fused_f) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 5);
             return true;
         }
@@ -14760,7 +14786,7 @@ struct Model::Impl {
         std::swap(d.h, d.h2);
         dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, l.il, p0, T);   // (post-layer residual, as the chunk path writes it)
-        CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
+        if (!fused_f) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         if (phases && T == 1) {
             const double ph4 = now_ms();
             ph[0] += ph2 - ph0; ph[1] += ph3 - ph2; ph[2] += ph4 - ph3; if (ph_prev > 0 && ph0 - ph_prev < 5.0) ph[3] += ph0 - ph_prev; ph_prev = ph4; ++ph_n;
