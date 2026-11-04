@@ -110,7 +110,7 @@ int env_tri(const char* name) {
 }
 // the decode layer's fused launches (A/B switches, off by default): DS4_FUSE=1 turns every one on, DS4_FUSE_<name>=1 / 0
 // one on / off whatever DS4_FUSE says.  DS4_FUSE_HC: hc_fused (hc_post + mix + split + pre-norm, two launches a layer
-// instead of six)
+// instead of six); DS4_FUSE_ROUTE: gate_route (the router and lookahead gates, their routes and the publish in one)
 bool fuse_on(const char* name) {
     const int own = env_tri(name);
     return own >= 0 ? own == 1 : env_tri("DS4_FUSE") == 1;
@@ -663,9 +663,10 @@ struct Dev {
     unsigned ar_seq = 0;
     unsigned* xcnt = nullptr;
     unsigned* hccnt = nullptr;   // [kWin] hc_mix_split's per-token block counters (zeroed at allocation, left zero)
-    // DS4_FUSE: hc_fused's partial sums and counters (zeroed at allocation, left zero)
+    // DS4_FUSE: hc_fused's partial sums and counters, gate_route's counters (zeroed at allocation, left zero)
     float* hfpart = nullptr;
     unsigned* hfcnt = nullptr;
+    unsigned* grcnt = nullptr;
     // the head group's members (the last layer's group): each its columns (split128 of V) of the head and the norms;
     // logits_part: a member's share of the logits (the lead's: where the others' land before they join its rows)
     x3::Mat head;
@@ -3256,7 +3257,7 @@ struct Model::Impl {
             if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
             if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hccnt, kWin, err) || !dalloc(d, d.hfpart, hc_fused_part(D), err) ||
-                !dalloc(d, d.hfcnt, kWin, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
+                !dalloc(d, d.hfcnt, kWin, err) || !dalloc(d, d.grcnt, kGateRouteCnt, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
                 !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
                 !dalloc(d, d.n_groups, 4, err))
                 return false;
@@ -14447,10 +14448,40 @@ struct Model::Impl {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0;
+            // DS4_FUSE_ROUTE: the router's gate, the lookahead gates (the same ones as below), their routes and the
+            // publish in one launch - the same logits, picks and request
+            static const bool fuse_route = fuse_on("DS4_FUSE_ROUTE");
+            bool routed = false;
+            if (fuse_route) {
+                GateSeg gs[3];
+                int ns = 0, nf[2] = {0, 0};
+                gs[ns].W = l.gate_w;
+                gs[ns].bias = l.gate_bias;
+                gs[ns].y = d.glog;
+                gs[ns].n = l.n_exp;
+                ++ns;
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    gs[ns].W = nx->gate_w;
+                    gs[ns].bias = nx->gate_bias;
+                    gs[ns].y = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gs[ns].n = nx->n_exp;
+                    gs[ns].m = m;
+                    gs[ns].off = (a - 1) * kAhead1;
+                    ++ns;
+                    nf[a - 1] = m;
+                }
+                routed = gate_route(d.x, D, T, gs, ns, 1024, l.k_exp, g.route_scale, l.vram_tab, d.ridx, d.rw, d.plan_ptr,
+                                    lead ? reqs + slot : nullptr, l.gate_bias_vl, l.mtp ? 0u : wp.vl, sq, nf[0], nf[1],
+                                    d.grcnt, s);
+            }
+            if (!routed) {
+            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
                 const Layer* nx = ahead_layer(L0, a);
@@ -14465,6 +14496,7 @@ struct Model::Impl {
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
+            }
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;

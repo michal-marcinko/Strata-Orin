@@ -253,6 +253,23 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// DS4_FUSE (the decode layer): gemv_f32 of the router's gate (seg[0]) and of up to two lookahead gates (seg[1], seg[2])
+/// on x [T][k], then route_publish of seg[0] (kp picks; vram, idx, w, plan_ptr, req, bias_vl, vl as route_publish's),
+/// route_ahead of the others (req->ahead[t][off ..)) and, req given, the publish (na0, na1, T, then seq) - one launch,
+/// the same logits and the same picks as those launches.  cnt: kGateRouteCnt zeroed counters (left zero).  False,
+/// nothing launched, where it does not apply (T > kWin, n > 1024, m > 16, misaligned, Metal).
+struct GateSeg {
+    const float* W = nullptr;      // [n][k] F32
+    const float* bias = nullptr;   // n
+    float* y = nullptr;            // the logits, rows ldy apart
+    int n = 0;
+    int m = 0;                     // a lookahead segment's picks to guess
+    int off = 0;                   // ... written from req->ahead[t][off]
+};
+constexpr int kGateRouteCnt = 3 * kWin + 1;
+bool gate_route(const float* x, int k, int T, const GateSeg* seg, int nseg, int ldy, int kp, float route_scale,
+                const unsigned long long* vram, int* idx, float* w, unsigned long long* plan_ptr, Req* req,
+                const float* bias_vl, unsigned vl, unsigned seq, int na0, int na1, unsigned* cnt, cudaStream_t s);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

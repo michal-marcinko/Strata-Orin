@@ -2171,6 +2171,159 @@ __global__ void __launch_bounds__(kThreads) hc_fused_kernel(const float* __restr
     }
     if (tid == 0) cnt[t] = 0u;
 }
+
+// gate_route_kernel: the router's gate GEMV (segment 0), the lookahead gates' (segments 1, 2: the next layers' gate_w on
+// this FFN input) and their routes in one launch.  Blocks [0, nb0) are segment 0's rows (8 a block, gemv_f32_kernel's
+// warp a row and its summing order: the same logits), then segment 1's, then 2's; blockIdx.y the token.  A segment's
+// last block for the token (an atomic count, reset by it) runs that segment's route on the logits: segment 0
+// route_publish_kernel's (picks, weights, plan, the request's ids / w / x), the others route_ahead_kernel's.  The picks
+// are the 512-thread kernels' at any block size (the best score, the lowest index on a tie).  Once every route of the
+// window is done the last of them publishes (publish_kernel's fences and order: na, T, then seq).
+struct GateSegK {
+    const float* W;
+    const float* bias;
+    float* y;
+    int n, nb, m, off;
+};
+struct GateRouteK {
+    GateSegK seg[3];
+    int nseg, k, ldy, kp;   // kp: segment 0's picks
+    float route_scale;
+    const unsigned long long* vram;
+    int* idx;
+    float* w;
+    unsigned long long* plan_ptr;
+    Req* req;
+    const float* bias_vl;
+    unsigned vl, seq;
+    int na0, na1;
+};
+// route_publish_kernel's selection for token t, any blockDim (a multiple of 32, <= 1024); logits read past the L1
+__device__ void gate_pick(const float* logits, const float* __restrict__ bias, int n, int k, float* sc, float* bs,
+                          float* bv, int* bi, int* pick, bool keep_sc, bool fallback) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float l = *(const volatile float*) (logits + i);
+        const float sp = l > 20.0f ? l : log1pf(expf(l));
+        const float sq = sqrtf(sp);
+        if (keep_sc) sc[i] = sq;
+        bs[i] = sq + bias[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            if (fallback) {
+                if (ix >= n) ix = route_fallback_pick(pick, r, n);   // (route_publish_kernel's)
+                pick[r] = ix;
+                bs[ix] = -FLT_MAX;
+            } else {   // (route_ahead_kernel's: -1 for a pick that never came out)
+                pick[r] = ix < n ? ix : -1;
+                if (ix < n) bs[ix] = -FLT_MAX;
+            }
+        }
+        __syncthreads();
+    }
+}
+__global__ void __launch_bounds__(kThreads) gate_route_kernel(const float* __restrict__ x, const GateRouteK p,
+                                                              unsigned* cnt) {
+    __shared__ float sc[1024], bs[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    __shared__ int pick[kAhead1 > 16 ? kAhead1 : 16];
+    __shared__ unsigned last;
+    __shared__ int on_cpu;
+    const int t = blockIdx.y, T = (int) gridDim.y;
+    int b = blockIdx.x, sg = 0;
+    if (p.nseg > 1 && b >= p.seg[0].nb) {
+        b -= p.seg[0].nb, sg = 1;
+        if (p.nseg > 2 && b >= p.seg[1].nb) b -= p.seg[1].nb, sg = 2;
+    }
+    GateSegK S = p.seg[0];
+    if (sg == 1) S = p.seg[1];
+    else if (sg == 2) S = p.seg[2];
+    {   // gemv_f32_kernel's row
+        const int row = b * (kThreads / 32) + (threadIdx.x >> 5);
+        const int lane = threadIdx.x & 31;
+        if (row < S.n) {
+            const float4* wr = (const float4*) (S.W + (size_t) row * p.k);
+            const float4* xv = (const float4*) (x + (size_t) t * p.k);
+            float acc = 0.0f;
+            for (int c = lane; c < p.k / 4; c += 32) {
+                const float4 a = wr[c], bb = xv[c];
+                acc = fmaf(a.x, bb.x, acc);
+                acc = fmaf(a.y, bb.y, acc);
+                acc = fmaf(a.z, bb.z, acc);
+                acc = fmaf(a.w, bb.w, acc);
+            }
+            acc = warp_sum(acc);
+            if (lane == 0) S.y[(size_t) t * p.ldy + row] = acc;
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) last = atomicAdd(cnt + sg * kWin + t, 1u) == (unsigned) S.nb - 1 ? 1u : 0u;
+    __syncthreads();
+    if (!last) return;
+    __threadfence();
+    if (threadIdx.x == 0) cnt[sg * kWin + t] = 0u;
+    const float* lg = S.y + (size_t) t * p.ldy;
+    if (sg == 0) {   // route_publish_kernel
+        const float* bias = p.bias_vl != nullptr && ((p.vl >> t) & 1u) ? p.bias_vl : S.bias;
+        gate_pick(lg, bias, S.n, p.kp, sc, bs, bv, bi, pick, true, true);
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < p.kp; ++r) s += sc[pick[r]];
+            int cpu = 0;
+            for (int r = 0; r < p.kp; ++r) {
+                const float wv = sc[pick[r]] / (s + 1e-20f) * p.route_scale;
+                p.idx[(size_t) t * kPicks + r] = pick[r];
+                p.w[(size_t) t * kPicks + r] = wv;
+                p.plan_ptr[(size_t) t * kPicks + r] = p.vram[pick[r]];
+                cpu |= p.vram[pick[r]] == 0ull;
+                if (p.req != nullptr) {
+                    p.req->ids[t][r] = pick[r];
+                    p.req->w[t][r] = wv;
+                }
+            }
+            on_cpu = cpu;
+        }
+        __syncthreads();
+        if (p.req != nullptr && on_cpu)
+            for (int i = threadIdx.x; i < p.k; i += blockDim.x) p.req->x[t][i] = x[(size_t) t * p.k + i];
+    } else {   // route_ahead_kernel
+        gate_pick(lg, S.bias, S.n, S.m, sc, bs, bv, bi, pick, false, false);
+        if (threadIdx.x == 0)
+            for (int r = 0; r < S.m; ++r) p.req->ahead[t][S.off + r] = pick[r];
+    }
+    if (p.req == nullptr) return;
+    // publish_kernel, by the last route of the window to finish
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(cnt + 3 * kWin, 1u) == (unsigned) (p.nseg * T) - 1) {
+        cnt[3 * kWin] = 0u;
+        __threadfence_system();
+        p.req->na[0] = p.na0;
+        p.req->na[1] = p.na1;
+        p.req->T = T;
+        __threadfence_system();
+        *(volatile unsigned*) &p.req->seq = p.seq;
+    }
+}
 #endif
 
 int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -2346,6 +2499,56 @@ bool hc_fused(const float* y, const float* post_in, const float* comb_in, const 
     else
         strata_ds4_launch(hc_fused_kernel<false>, grid, kThreads, 0, s, y, post_in, comb_in, h, h_out, fn, dim, n_mix, eps,
                           mixes, part, cnt, scale, base, iters, hc_eps, pre, post, comb, pre_copy, norm_mix, norm_w, eps, x);
+    return true;
+#endif
+}
+
+bool gate_route(const float* x, int k, int T, const GateSeg* seg, int nseg, int ldy, int kp, float route_scale,
+                const unsigned long long* vram, int* idx, float* w, unsigned long long* plan_ptr, Req* req,
+                const float* bias_vl, unsigned vl, unsigned seq, int na0, int na1, unsigned* cnt, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    (void) x; (void) k; (void) T; (void) seg; (void) nseg; (void) ldy; (void) kp; (void) route_scale; (void) vram;
+    (void) idx; (void) w; (void) plan_ptr; (void) req; (void) bias_vl; (void) vl; (void) seq; (void) na0; (void) na1;
+    (void) cnt; (void) s;
+    return false;
+#else
+    if (T < 1 || T > kWin || nseg < 1 || nseg > 3 || (nseg > 1 && req == nullptr) || k <= 0 || k % 4 != 0 ||
+        k > kMaxDim || ((size_t) x & 15u) != 0 || kp < 1 || kp > kPicks || cnt == nullptr || vram == nullptr)
+        return false;
+    GateRouteK p;
+    int nb = 0;
+    for (int i = 0; i < nseg; ++i) {
+        const GateSeg& sgi = seg[i];
+        if (sgi.W == nullptr || sgi.bias == nullptr || sgi.y == nullptr || sgi.n < 1 || sgi.n > 1024 ||
+            ((size_t) sgi.W & 15u) != 0)
+            return false;
+        if (i > 0 && (sgi.m < 1 || sgi.m > 16 || sgi.off < 0 || sgi.off + sgi.m > kAhead)) return false;
+        p.seg[i].W = sgi.W;
+        p.seg[i].bias = sgi.bias;
+        p.seg[i].y = sgi.y;
+        p.seg[i].n = sgi.n;
+        p.seg[i].nb = cdiv(sgi.n, kThreads / 32);
+        p.seg[i].m = i > 0 ? sgi.m : kp;
+        p.seg[i].off = i > 0 ? sgi.off : 0;
+        nb += p.seg[i].nb;
+    }
+    for (int i = nseg; i < 3; ++i) p.seg[i] = p.seg[0];   // (unused)
+    p.nseg = nseg;
+    p.k = k;
+    p.ldy = ldy;
+    p.kp = kp;
+    p.route_scale = route_scale;
+    p.vram = vram;
+    p.idx = idx;
+    p.w = w;
+    p.plan_ptr = plan_ptr;
+    p.req = req;
+    p.bias_vl = vl != 0 ? bias_vl : nullptr;
+    p.vl = vl;
+    p.seq = seq;
+    p.na0 = na0;
+    p.na1 = na1;
+    strata_ds4_launch(gate_route_kernel, dim3((unsigned) nb, (unsigned) T), kThreads, 0, s, x, p, cnt);
     return true;
 #endif
 }
