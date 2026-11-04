@@ -76,6 +76,10 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 /// roles' types in lay.K, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+/// moe_down in two: the device's experts' down (false: not covered, nothing issued) and the combine, which alone reads the
+/// CPU lane's part (cpu_part / cpu_flag) - the lane's wait may go between them
+bool moe_down_part(const x3::MoeArgs& a, const float* h, cudaStream_t s);
+void moe_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s);

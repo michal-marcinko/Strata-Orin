@@ -1346,7 +1346,8 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
         static const bool plain = std::getenv("DS4_MV_PLAIN") != nullptr;   // (DS4_MV_PLAIN: the plain kernel, for A/B checks)
         bool aligned = !plain;
         for (int j = 0; j < nj && aligned; ++j) aligned = ((uintptr_t) J.j[j].w % 16) == 0 && J.j[j].ld % 16 == 0;
-        if (std::getenv("DS4_MV_LOG") != nullptr) {
+        static const bool mv_log = std::getenv("DS4_MV_LOG") != nullptr;
+        if (mv_log) {
             static std::atomic<int> logged{0};
             if (logged.fetch_add(1) < 400)
                 std::fprintf(stderr, "mv Q5_K: %d jobs, n %d k %d, w %% 16 = %d, ld %zu -> %s\n", nj, J.j[0].n, J.j[0].k,

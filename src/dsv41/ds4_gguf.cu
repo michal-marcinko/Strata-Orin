@@ -1496,10 +1496,17 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     check("moe_gate_up");
 }
 
+// moe_down = moe_down_part (the device's experts' down into the scratch's parts) + moe_combine (the parts, the CPU lane's and the
+// shared expert's into out).  Only the combine reads the CPU lane's part: a caller may issue the part before it waits for the lane.
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
-    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
+    if (!moe_down_part(a, h, s)) return;
+    moe_combine(a, sh_out, out, s);
+}
+
+bool moe_down_part(const x3::MoeArgs& a, const float* h, cudaStream_t s) {
+    if (!mx_geometry("moe_down", a.k, a.n_embd, a.n_ff) || h == nullptr) return false;
     Scratch* sc = scratch(s);
-    if (sc == nullptr) return;
+    if (sc == nullptr) return false;
     MxArgs m = mx_args(a.lay, a.n_embd, a.n_ff, a.limit);
     m.plan_ptr = a.plan_ptr;
     m.h = const_cast<float*>(h);
@@ -1509,7 +1516,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     (mx_experts(a.lay) ? q8_quant : iq_act_quant)(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
     if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return false;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
@@ -1523,6 +1530,12 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
 #endif
             launch_groups<DownK>(m, a.n_embd, a.k, 1, s);
     }
+    return true;
+}
+
+void moe_combine(const x3::MoeArgs& a, const float* sh_out, float* out, cudaStream_t s) {
+    Scratch* sc = scratch(s);
+    if (sc == nullptr) return;
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;

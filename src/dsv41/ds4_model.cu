@@ -14194,10 +14194,16 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
+                // the device's experts' down before the wait for the CPU lane (a GGUF layer that streams nothing: the lane's
+                // part is read only by the combine, so the same bits) - the GPU works while the lane computes, not after it.
+                // DS4_EARLY_DOWN=0: down after the wait, as before
+                static const bool early_dn = env_tri("DS4_EARLY_DOWN") != 0;
+                const bool early = early_dn && mx && lc < 0 && gg::moe_down_part(ma, d.xg, s);
                 if (lead) wait_seq(&resps[slot].seq, sq, s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
-                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (early) gg::moe_combine(ma, d.sh_out, d.moe_out, s);
+                else if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
             } else {   // each distinct expert read once for the window's tokens
